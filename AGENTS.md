@@ -43,6 +43,13 @@ conventions and commands; do not duplicate design content here.
   via `scripts/download_data.py`; the full dataset is private, on request. Never
   commit image files, and never add them to git-lfs or submodules without an
   explicit decision recorded in `docs/design.md`.
+- **CPU-first**: all tests and smoke checks must pass on CPU-only machines using
+  `configs/smoke.yaml` / `configs/tiny.yaml`. GPU is never assumed available;
+  `configs/base.yaml` training runs on GPU/Colab only (see `docs/design.md` §5).
+- **One training at a time**: before launching any training, check
+  `pgrep -f spheroid_seg.train` and kill leftovers. Never run two trainings
+  concurrently. Each run writes to a unique `outputs/runs/<config>_<timestamp>/`
+  directory so runs never overwrite each other.
 
 ## Testing rules
 

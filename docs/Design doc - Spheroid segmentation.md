@@ -167,6 +167,26 @@ consistent and the hybrid approach disappoints.
 - Notebook group: `jupyter`, `matplotlib` (QC/exploration).
 - Logging: per-epoch CSV (keep v0.1 dependency-light; TensorBoard optional).
 
+### Hardware strategy
+
+**CPU-first development**: all tests, smoke checks, and short synthetic trainings
+must pass on CPU-only machines using `configs/smoke.yaml` / `configs/tiny.yaml`.
+GPU is never assumed available and never required for development or CI.
+
+Full-model training (`configs/base.yaml`, 512² patches, 7.7M params) targets a
+free cloud GPU tier (e.g. Colab T4 16 GB) or any on-demand local CUDA GPU with
+~8 GB VRAM. A local ROCm iGPU may serve as a light-GPU option, but JAX-on-ROCm
+support must be verified (`jax.devices()`) before relying on it.
+
+Consequences:
+
+- Cloud workflow: clone repo + `uv sync`, upload `data/` out-of-band (e.g.
+  Drive), run training, download checkpoints. Cloud sessions can be cut at any
+  time, so checkpoints must be saved frequently and training must be resumable.
+  This also doubles as a clean-room reproducibility test of the repo.
+- The full `base.yaml` overfit-one-batch acceptance check is impractical on
+  CPU; run it once on GPU.
+
 ```bash
 uv sync --all-groups                 # full dev setup
 uv run pytest                        # tests
@@ -184,7 +204,12 @@ spheroid-seg/
   pyproject.toml             # uv-managed manifest
   README.md                  # quickstart, citing this design doc
   docs/design.md             # THIS document
+  docs/data-pipeline.md      # data pipeline walkthrough
+  docs/training.md           # training pipeline walkthrough
+  docs/status.md             # module progress and pending items
   configs/base.yaml          # num_classes, patch_size, lr, features, paths, seed
+  configs/tiny.yaml          # small config for CPU smoke trainings
+  configs/smoke.yaml         # minimal config for CI / overfit-one-batch checks
   src/spheroid_seg/
     data/                    # dataset, patching, augmentation, splits
     models/unet.py           # Flax U-Net
