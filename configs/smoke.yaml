@@ -1,20 +1,20 @@
-# Base configuration for the spheroid segmentation pipeline.
-# All hyperparameters and paths live here; no hardcoded values in source code.
+# Smoke-test configuration: small model and patches for fast CPU runs.
+# Production training should use configs/base.yaml.
 
 # Model
 num_classes: 3
-patch_size: 512
+patch_size: 256
 base_features: 32
 
 # Optimization
 lr: 1.0e-3
 weight_decay: 1.0e-4
-batch_size: 8
-epochs: 100
-early_stopping_patience: 20
+batch_size: 4
+epochs: 30
+early_stopping_patience: 15
 
 # Class weights for cross-entropy (background down-weighted)
-class_weights: [0.1, 1.0, 1.0]
+class_weights: [0.5, 1.0, 1.0]
 
 seed: 42
 
@@ -26,7 +26,7 @@ data:
   slimia_dir: data/slimia
 
 # Data pipeline
-input_channels: grayscale  # "rgb" | "grayscale"
+input_channels: grayscale
 class_mapping:
   0: 0
   1: 1
@@ -36,7 +36,7 @@ class_mapping:
 # Patching
 min_object_fraction: 0.05
 object_patch_ratio: 0.8
-patches_per_image: 16
+patches_per_image: 8
 
 # Augmentation (probabilities and Albumentations parameters)
 augment:

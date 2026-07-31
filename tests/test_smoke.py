@@ -16,6 +16,8 @@ REQUIRED_CONFIG_KEYS = {
     "lr",
     "weight_decay",
     "batch_size",
+    "epochs",
+    "early_stopping_patience",
     "seed",
     "data",
     "outputs",
@@ -24,6 +26,7 @@ REQUIRED_CONFIG_KEYS = {
     "min_object_fraction",
     "object_patch_ratio",
     "patches_per_image",
+    "class_weights",
     "augment",
 }
 
