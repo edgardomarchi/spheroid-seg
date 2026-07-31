@@ -19,9 +19,42 @@ data:
   splits_dir: data/splits
   slimia_dir: data/slimia
 
+# Data pipeline
+input_channels: grayscale  # "rgb" | "grayscale"
+class_mapping:
+  0: 0
+  1: 1
+  2: 2
+  3: 2
+
+# Patching
+min_object_fraction: 0.05
+object_patch_ratio: 0.8
+patches_per_image: 16
+
+# Augmentation (probabilities and Albumentations parameters)
+augment:
+  flip_probability: 0.5
+  rotate90_probability: 0.5
+  elastic_probability: 0.3
+  scale_probability: 0.5
+  blur_probability: 0.2
+  noise_probability: 0.2
+  brightness_contrast_probability: 0.5
+  scale_range: [0.5, 2.0]
+  elastic_alpha: 1
+  elastic_sigma: 50
+  blur_limit: [3, 7]
+  blur_sigma_limit: [0.1, 2.0]
+  noise_std_range: [0.01, 0.05]
+  brightness_limit: 0.3
+  contrast_limit: 0.3
+
 # Generated artifacts (never committed)
 outputs:
   checkpoints_dir: outputs/checkpoints
   logs_dir: outputs/logs
   predictions_dir: outputs/predictions
   metrics_dir: outputs/metrics
+  qc_dir: outputs/qc
+  debug_dir: outputs/debug

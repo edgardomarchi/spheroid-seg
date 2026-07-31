@@ -19,6 +19,12 @@ REQUIRED_CONFIG_KEYS = {
     "seed",
     "data",
     "outputs",
+    "input_channels",
+    "class_mapping",
+    "min_object_fraction",
+    "object_patch_ratio",
+    "patches_per_image",
+    "augment",
 }
 
 
