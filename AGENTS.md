@@ -44,6 +44,18 @@ conventions and commands; do not duplicate design content here.
   commit image files, and never add them to git-lfs or submodules without an
   explicit decision recorded in `docs/design.md`.
 
+## Testing rules
+
+- Tests encode the spec (docs/design.md + the task's acceptance criteria).
+  NEVER weaken, delete, skip, or relax an assertion to make a failing test
+  pass. If a test contradicts the implementation, fix the implementation —
+  or stop and escalate the conflict in the session report.
+- Any modification to an EXISTING test must be flagged and justified in the
+  session report (what changed, why the old assertion was wrong).
+- Each acceptance criterion from the task prompt maps to at least one test;
+  include negative tests (invalid inputs must be rejected, not just valid
+  ones accepted).
+
 ## Git workflow
 
 - **The agent NEVER runs git write operations** (`add`, `commit`, `push`,
@@ -59,7 +71,7 @@ conventions and commands; do not duplicate design content here.
 
 ## Session reports
 
-At the end of every task, write a Markdown report to `/temp/spheroid-seg/` with a
+At the end of every task, write a Markdown report to `outputs/reports/` with a
 file name representative of the actions taken (e.g. `m1-data-pipeline.md`,
 `fix-config-loading.md`). The report must list: files created/modified, commands
 run with their outputs (acceptance criteria), decisions made, and any deviations
