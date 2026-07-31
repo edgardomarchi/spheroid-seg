@@ -1,0 +1,27 @@
+# Base configuration for the spheroid segmentation pipeline.
+# All hyperparameters and paths live here; no hardcoded values in source code.
+
+# Model
+num_classes: 3
+patch_size: 512
+base_features: 32
+
+# Optimization
+lr: 1.0e-3
+weight_decay: 1.0e-4
+batch_size: 8
+seed: 42
+
+# Data layout (all paths are relative to the repository root)
+data:
+  raw_dir: data/raw
+  masks_dir: data/masks
+  splits_dir: data/splits
+  slimia_dir: data/slimia
+
+# Generated artifacts (never committed)
+outputs:
+  checkpoints_dir: outputs/checkpoints
+  logs_dir: outputs/logs
+  predictions_dir: outputs/predictions
+  metrics_dir: outputs/metrics

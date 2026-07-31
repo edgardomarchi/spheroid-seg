@@ -1,0 +1,85 @@
+[project]
+name = "spheroid-seg"
+version = "0.1.0"
+description = "Open-source pipeline for segmenting spheroids and loose cells in phase-contrast microscopy images."
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+authors = [
+    { name = "Spheroid Seg Team" },
+]
+keywords = ["segmentation", "microscopy", "spheroid", "jax", "flax"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+dependencies = [
+    "jax",
+    "flax",
+    "optax",
+    "albumentations",
+    "scikit-image",
+    "scipy",
+    "opencv-python-headless",
+    "tifffile",
+    "numpy",
+    "pyyaml",
+]
+
+[project.urls]
+Repository = "https://github.com/example/spheroid-seg"
+Documentation = "https://github.com/example/spheroid-seg/blob/main/docs/design.md"
+
+[project.scripts]
+spheroid-train = "spheroid_seg.train:main"
+spheroid-eval = "spheroid_seg.eval:main"
+spheroid-infer = "spheroid_seg.infer:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+notebooks = [
+    "jupyter",
+    "matplotlib",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spheroid_seg"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "W",
+    "N",
+    "D",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+]
+ignore = [
+    "D100",
+    "D104",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

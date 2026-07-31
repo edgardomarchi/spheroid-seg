@@ -1,0 +1,36 @@
+# Data directory: structure and splits are committed, contents are not.
+data/**
+!data/**/.gitkeep
+!data/splits/
+!data/splits/*.txt
+
+# Generated artifacts
+outputs/
+
+# uv / virtual environments
+.venv/
+venv/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
