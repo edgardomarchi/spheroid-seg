@@ -28,6 +28,7 @@ REQUIRED_CONFIG_KEYS = {
     "patches_per_image",
     "class_weights",
     "augment",
+    "eval",
 }
 
 

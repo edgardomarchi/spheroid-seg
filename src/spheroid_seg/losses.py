@@ -87,7 +87,6 @@ def segmentation_loss(
     Returns:
         Scalar combined loss.
     """
-    return (
-        dice_weight * dice_loss(logits, targets, epsilon=epsilon)
-        + ce_weight * cross_entropy_loss(logits, targets, class_weights=class_weights)
-    )
+    return dice_weight * dice_loss(
+        logits, targets, epsilon=epsilon
+    ) + ce_weight * cross_entropy_loss(logits, targets, class_weights=class_weights)

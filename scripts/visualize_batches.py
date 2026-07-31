@@ -86,9 +86,7 @@ def _overlay(image: np.ndarray, mask: np.ndarray, alpha: float = 0.4) -> np.ndar
 
 def main(argv: list[str] | None = None) -> int:
     """Generate augmented-batch visualization and print class statistics."""
-    parser = argparse.ArgumentParser(
-        description="Visualize augmented image/mask patches."
-    )
+    parser = argparse.ArgumentParser(description="Visualize augmented image/mask patches.")
     parser.add_argument(
         "--config",
         default="configs/base.yaml",

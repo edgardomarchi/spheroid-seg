@@ -22,7 +22,7 @@ from flax.training import train_state
 from spheroid_seg.data.augment import apply_augmentation, build_augmentation
 from spheroid_seg.data.dataset import SpheroidDataset
 from spheroid_seg.data.patching import extract_patches
-from spheroid_seg.data.synthetic import generate_synthetic_dataset
+from spheroid_seg.data.synthetic import generate_synthetic_dataset, synthetic_split_names
 from spheroid_seg.losses import segmentation_loss
 from spheroid_seg.metrics import dice_score
 from spheroid_seg.models.unet import UNet
@@ -323,13 +323,17 @@ def train(
                 val_pairs, raw_dir, masks_dir, config["input_channels"], config["class_mapping"]
             )
         else:
-            # Smoke-test path: split the dataset 80/20 by base name.
-            all_pairs = train_dataset.pairs
-            np_rng.shuffle(all_pairs)
-            split = int(0.8 * len(all_pairs))
-            train_dataset.pairs = all_pairs[:split]
+            # Smoke-test path: use the deterministic, magnification-stratified
+            # synthetic split shared with eval.py.
+            n_images = config.get("synthetic_n_images", 16)
+            splits = synthetic_split_names(n_images, seed=config["seed"])
+            train_names = set(splits["train"])
+            val_names = set(splits["val"])
+            train_pairs = [p for p in train_dataset.pairs if p[2] in train_names]
+            val_pairs = [p for p in train_dataset.pairs if p[2] in val_names]
+            train_dataset.pairs = train_pairs
             val_dataset = _dataset_from_pairs(
-                all_pairs[split:],
+                val_pairs,
                 raw_dir,
                 masks_dir,
                 config["input_channels"],
@@ -338,22 +342,17 @@ def train(
 
         if len(train_dataset) == 0 or len(val_dataset) == 0:
             raise ValueError(
-                "Train or validation set is empty. "
-                "Provide real data or rely on synthetic fallback."
+                "Train or validation set is empty. Provide real data or rely on synthetic fallback."
             )
 
         print(f"Training on {len(train_dataset)} images, validating on {len(val_dataset)} images.")
 
         print("Building training patches...")
-        train_images, train_masks = _build_patch_arrays(
-            train_dataset, config, np_rng, augment=True
-        )
+        train_images, train_masks = _build_patch_arrays(train_dataset, config, np_rng, augment=True)
         print(f"  {len(train_images)} training patches.")
 
         print("Building validation patches...")
-        val_images, val_masks = _build_patch_arrays(
-            val_dataset, config, np_rng, augment=False
-        )
+        val_images, val_masks = _build_patch_arrays(val_dataset, config, np_rng, augment=False)
         print(f"  {len(val_images)} validation patches.")
 
         steps_per_epoch = max(len(train_images) // config["batch_size"], 1)

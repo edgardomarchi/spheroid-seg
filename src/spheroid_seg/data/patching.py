@@ -87,10 +87,7 @@ def extract_patches(
 
     max_attempts = max(patches_per_image * 10, 1000)
     for _ in range(max_attempts):
-        if (
-            len(object_patches) >= target_object
-            and len(background_patches) >= target_background
-        ):
+        if len(object_patches) >= target_object and len(background_patches) >= target_background:
             break
 
         y = rng.integers(0, h - patch_size + 1)

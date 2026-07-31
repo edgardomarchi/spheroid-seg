@@ -32,9 +32,7 @@ def _tree_allclose(a: object, b: object) -> bool:
     leaves_b = jax.tree_util.tree_leaves(b)
     if len(leaves_a) != len(leaves_b):
         return False
-    return all(
-        jnp.allclose(lea, leb) for lea, leb in zip(leaves_a, leaves_b, strict=False)
-    )
+    return all(jnp.allclose(lea, leb) for lea, leb in zip(leaves_a, leaves_b, strict=False))
 
 
 @pytest.mark.parametrize("input_channels", ["grayscale", "rgb"])

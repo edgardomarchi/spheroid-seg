@@ -38,9 +38,7 @@ def test_qc_rejects_shape_mismatch(
     assert exit_code == 1
 
 
-def test_qc_rejects_wrong_dtype(
-    tmp_raw_mask_dirs: tuple[Path, Path], make_pair: callable
-) -> None:
+def test_qc_rejects_wrong_dtype(tmp_raw_mask_dirs: tuple[Path, Path], make_pair: callable) -> None:
     """QC fails when a mask is not uint8."""
     raw_dir, masks_dir = tmp_raw_mask_dirs
     make_pair("bad_dtype")

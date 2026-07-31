@@ -30,9 +30,7 @@ def test_remap_classes_default_mapping() -> None:
     np.testing.assert_array_equal(mapped, expected)
 
 
-def test_load_pair_grayscale(
-    tmp_raw_mask_dirs: tuple[Path, Path], make_pair: callable
-) -> None:
+def test_load_pair_grayscale(tmp_raw_mask_dirs: tuple[Path, Path], make_pair: callable) -> None:
     """Loading a grayscale pair returns a normalized 2D image and remapped mask."""
     raw_dir, masks_dir = tmp_raw_mask_dirs
     make_pair("img1", raw_channels="grayscale")
@@ -52,9 +50,7 @@ def test_load_pair_grayscale(
     assert set(np.unique(mask)).issubset({0, 1, 2})
 
 
-def test_load_pair_rgb(
-    tmp_raw_mask_dirs: tuple[Path, Path], make_pair: callable
-) -> None:
+def test_load_pair_rgb(tmp_raw_mask_dirs: tuple[Path, Path], make_pair: callable) -> None:
     """Loading with input_channels='rgb' returns a 3-channel image."""
     raw_dir, masks_dir = tmp_raw_mask_dirs
     make_pair("img1", raw_channels="rgb")

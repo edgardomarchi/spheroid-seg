@@ -54,11 +54,7 @@ def _collect_pairs(raw_dir: Path, masks_dir: Path) -> list[tuple[Path, Path, str
 
     pairs: list[tuple[Path, Path, str]] = []
     for path in sorted(masks_dir.iterdir()):
-        if (
-            path.is_file()
-            and path.suffix.lower() in IMAGE_EXTENSIONS
-            and path.stem in raw_by_stem
-        ):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS and path.stem in raw_by_stem:
             pairs.append((raw_by_stem[path.stem], path, path.stem))
     return pairs
 
@@ -83,9 +79,7 @@ def _validate_pair(
     raw_hw = raw_shape[:2]
     mask_hw = mask.shape[:2]
     if raw_hw != mask_hw:
-        violations.append(
-            f"shape mismatch: raw {raw_hw} vs mask {mask_hw}"
-        )
+        violations.append(f"shape mismatch: raw {raw_hw} vs mask {mask_hw}")
 
     if mask.dtype != np.uint8:
         violations.append(f"mask dtype {mask.dtype} != uint8")

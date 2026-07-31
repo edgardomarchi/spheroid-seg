@@ -60,9 +60,7 @@ def dice_score(
     intersection, prediction_area, target_area = _per_class_counts(
         predictions, targets, num_classes
     )
-    dice = (2.0 * intersection + epsilon) / (
-        prediction_area + target_area + epsilon
-    )
+    dice = (2.0 * intersection + epsilon) / (prediction_area + target_area + epsilon)
 
     # True negatives: class absent from both prediction and target -> 1.0.
     absent_from_both = (prediction_area == 0) & (target_area == 0)

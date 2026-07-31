@@ -64,3 +64,9 @@ outputs:
   metrics_dir: outputs/metrics
   qc_dir: outputs/qc
   debug_dir: outputs/debug
+
+# Evaluation
+eval:
+  batch_size: 4
+  num_overlay_samples: 8
+  overlay_panel_width: 384

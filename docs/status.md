@@ -4,7 +4,7 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-07-31 (after M3).
+Last updated: 2026-07-31 (after M4).
 
 ## Modules
 
@@ -14,7 +14,7 @@ Last updated: 2026-07-31 (after M3).
 | M1 — Data pipeline | Done | dataset, patching (mask-guided), augmentation, synthetic fixtures; see `docs/data-pipeline.md` |
 | M2 — U-Net (Flax) | Done | from scratch, 7.7M params at base_features=32; BatchNorm `batch_stats` verified |
 | M3 — Training loop | Done | losses (Dice + weighted CE), metrics, TrainState + AdamW, unique run dirs, `--overfit-one-batch`; see `docs/training.md`. 48 tests green, ruff clean |
-| M4 — Evaluation CLI | Next | per-class Dice/IoU, confusion, overlays; must report metrics per magnification |
+| M4 — Evaluation CLI | Done | per-class Dice/IoU, confusion, overlays, per-magnification grouping, checkpoint resolution; see `docs/evaluation.md` |
 | M5 — Inference (stitching) | Pending | full-image patch stitching |
 | M6 — Post-processing (v0.2) | Pending | instances, morphometrics, hybrid spheroid/organoid classification |
 | M7 — SLiMIA pre-training | Deferred | domain-shift risk; only if own data underperforms |
@@ -33,6 +33,11 @@ Last updated: 2026-07-31 (after M3).
   verification.
 - **Determinism is a hard requirement**, verified manually: identical commands
   must give identical losses. Re-verify after any pipeline change.
+- **Synthetic train/val/test split is shared** between `train.py` and `eval.py`
+  via `synthetic_split_names` so evaluation never sees training images.
+- **Synthetic filenames carry magnification** (`_4x` / `_10x`) and 10x objects
+  are drawn larger than 4x objects, making the per-magnification breakdown
+  meaningful while keeping the task learnable.
 
 ## Pending — technical
 
@@ -41,6 +46,8 @@ Last updated: 2026-07-31 (after M3).
 - Verify whether JAX sees the notebook iGPU under ROCm (`jax.devices()`).
 - Real-data wiring: `data/splits/*.txt` + train/val leak check when annotated
   images arrive (stratified split script task).
+- M5 — full-image stitching inference: add overlapping tiles with logit averaging
+  (current M4 tiling is non-overlapping).
 - Optional: `--seed` CLI override for `visualize_batches.py`.
 
 ## Pending — clinical group
