@@ -30,6 +30,11 @@ dependencies = [
     "pyyaml",
 ]
 
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]"]
+cuda13 = ["jax[cuda13]"]
+rocm   = ["jax[rocm7-local]"]
+
 [project.urls]
 Repository = "https://github.com/example/spheroid-seg"
 Documentation = "https://github.com/example/spheroid-seg/blob/main/docs/design.md"
