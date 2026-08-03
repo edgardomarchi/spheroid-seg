@@ -70,3 +70,8 @@ eval:
   batch_size: 2
   num_overlay_samples: 4
   overlay_panel_width: 128
+
+# Inference (full-image stitching)
+infer:
+  overlap: 0.15
+  batch_size: 2

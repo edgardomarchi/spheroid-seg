@@ -29,6 +29,7 @@ REQUIRED_CONFIG_KEYS = {
     "class_weights",
     "augment",
     "eval",
+    "infer",
 }
 
 
