@@ -4,7 +4,7 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-08-04 (after stratified split script).
+Last updated: 2026-08-04 (after user docs and LICENSE).
 
 ## Modules
 
@@ -41,6 +41,15 @@ Last updated: 2026-08-04 (after stratified split script).
 - **ROCm iGPU experiment outcome** (M5): `jax.devices()` only reports the CPU on
   the test machine's iGPU (gfx1152) under ROCm 7. Local development stays
   CPU-first; the GPU path remains Colab/cloud CUDA, as stated in the design doc.
+
+## Pending — v0.1 public release
+
+- Real annotated data: first batch of masks per spec in `docs/design.md` §2.2 and
+  the first real train/val leak check.
+- Full `configs/base.yaml --overfit-one-batch` acceptance check on GPU/Colab
+  (impractical on CPU; smoke-config substitute passed).
+- CI pipeline (GitHub Actions) covering Python 3.12/3.13/3.14.
+- Zenodo sample publication + `scripts/download_data.py` fetch step.
 
 ## Pending — technical
 

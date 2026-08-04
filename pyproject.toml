@@ -5,7 +5,7 @@ description = "Open-source pipeline for segmenting spheroids and loose cells in 
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 authors = [
-    { name = "Spheroid Seg Team" },
+    { name = "Edgardo Marchi" },
 ]
 keywords = ["segmentation", "microscopy", "spheroid", "jax", "flax"]
 classifiers = [
@@ -36,8 +36,8 @@ cuda13 = ["jax[cuda13]"]
 rocm   = ["jax[rocm7-local]"]
 
 [project.urls]
-Repository = "https://github.com/example/spheroid-seg"
-Documentation = "https://github.com/example/spheroid-seg/blob/main/docs/design.md"
+Repository = "https://github.com/edgardomarchi/spheroid-seg"
+Documentation = "https://github.com/edgardomarchi/spheroid-seg/blob/main/docs/design.md"
 
 [project.scripts]
 spheroid-train = "spheroid_seg.train:main"
