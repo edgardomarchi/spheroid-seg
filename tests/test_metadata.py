@@ -30,13 +30,17 @@ def test_parse_magnification_unknown() -> None:
 
 
 def test_load_metadata_csv_precedence_over_filename(tmp_path: Path) -> None:
-    """CSV entries override the filename-derived magnification."""
+    """CSV entries override the filename-derived magnification.
+
+    Keys are normalised to file stems so they match raw/mask base names
+    regardless of extension.
+    """
     csv_path = tmp_path / "metadata.csv"
     csv_path.write_text("image_name,magnification\nimg_4x.png,10x\nimg_plain.png,4x\n")
 
     meta = load_metadata_csv(csv_path)
-    assert meta["img_4x.png"] == "10x"
-    assert meta["img_plain.png"] == "4x"
+    assert meta["img_4x"] == "10x"
+    assert meta["img_plain"] == "4x"
 
 
 def test_load_metadata_csv_malformed_header(tmp_path: Path) -> None:

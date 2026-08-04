@@ -2,6 +2,22 @@
 
 How raw images and annotations become training batches.
 
+## Real data onboarding
+
+When annotated real images arrive:
+
+1. **Run QC**: `uv run python -m spheroid_seg.data.qc --raw-dir data/raw --mask-dir data/masks`.
+   Fix any spec violations (wrong dimensions, values outside {0,1,2,3}, etc.).
+2. **Fill `data/metadata.csv`** with at least the columns `image,magnification`.
+   Add an optional `condition` column (e.g. cell line) if you want joint
+   stratification; the script falls back to magnification-only if any
+   `(magnification, condition)` group is too small.
+3. **Create the splits**: `uv run python scripts/make_splits.py --config configs/base.yaml`.
+   This writes deterministic, stratified `data/splits/{train,val,test}.txt` files.
+   Use `--force` only when you intentionally want to overwrite existing splits.
+4. **Train/eval as usual**: `uv run python -m spheroid_seg.train --config configs/base.yaml`
+   and `uv run python -m spheroid_seg.eval --config configs/base.yaml`.
+
 ## Overview
 
 ```

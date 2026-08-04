@@ -4,7 +4,7 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-08-03 (after M5).
+Last updated: 2026-08-04 (after stratified split script).
 
 ## Modules
 
@@ -46,8 +46,9 @@ Last updated: 2026-08-03 (after M5).
 
 - Run the full `configs/base.yaml --overfit-one-batch` acceptance check on
   GPU/Colab (impractical on CPU; smoke-config substitute passed).
-- Real-data wiring: `data/splits/*.txt` + train/val leak check when annotated
-  images arrive (stratified split script task).
+- Real-data wiring: the stratified split script (`scripts/make_splits.py`) is
+  done; what remains is the arrival of the first batch of annotated images and
+  the first real train/val leak check.
 - Optional: `--seed` CLI override for `visualize_batches.py`.
 
 ## Pending — clinical group
