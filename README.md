@@ -23,45 +23,93 @@ for 3-class semantic segmentation:
 
 ## Installation
 
-You need Python `>=3.12,<3.15` and [uv](https://docs.astral.sh/uv/):
+You need Python `>=3.12,<3.15`.
+
+### User path — pip (recommended for running the pipeline)
+
+This is the common denominator for bioimage workstations. It uses a standard
+virtual environment and `pip`.
+
+```bash
+python -m venv .venv
+# Linux / macOS:
+source .venv/bin/activate
+# Windows:
+# .venv\Scripts\activate
+
+pip install -e .
+```
+
+To also install the test tools, use a PEP 735 dependency group (requires
+**pip ≥ 25.1**):
+
+```bash
+pip install -e . --group dev
+```
+
+On older pip versions you can install them manually:
+
+```bash
+pip install -e .
+pip install pytest ruff
+```
+
+For NVIDIA GPU support, install the corresponding JAX extra instead:
+
+```bash
+pip install -e ".[cuda12]"
+# or, for CUDA 13:
+# pip install -e ".[cuda13]"
+```
+
+### Development path — uv (recommended for contributors)
+
+[uv](https://docs.astral.sh/uv/) gives a locked, reproducible environment and is
+the tool used for day-to-day development:
 
 ```bash
 uv sync --all-groups
 ```
 
-This installs JAX/Flax, Optax, Albumentations, OpenCV, scikit-image, and the
-dev tools (pytest, ruff).
+For GPU support:
+
+```bash
+uv sync --all-groups --extra cuda12
+# or --extra cuda13
+# or --extra rocm7-local #check jax/amd docs for your ROCm version
+```
 
 ## Quickstart (no data required)
 
-The repo works out of the box with synthetic fixtures, so you can verify the
-full pipeline on a CPU-only laptop in a few minutes.
+After activating your environment, the same commands work whether you installed
+with pip or uv. uv users can either activate `.venv` and run the commands below
+as-is, or prefix any command with `uv run` (e.g. `uv run pytest`).
 
 ```bash
 # 1. Run the test suite
-uv run pytest
+pytest -q
 
 # 2. Visualize a batch of augmented patches
-uv run python scripts/visualize_batches.py --config configs/tiny.yaml
+python scripts/visualize_batches.py --config configs/tiny.yaml
 #    → outputs/debug/augmented_batches.png
 
 # 3. Train a small model for a few epochs on synthetic data
-uv run python -m spheroid_seg.train --config configs/tiny.yaml --epochs 5
+python -m spheroid_seg.train --config configs/tiny.yaml --epochs 5
 #    → outputs/runs/tiny_<timestamp>/
 
 # 4. Evaluate the latest checkpoint on the synthetic test split
-uv run python -m spheroid_seg.eval --config configs/tiny.yaml --split test
+python -m spheroid_seg.eval --config configs/tiny.yaml --split test
 #    → outputs/evals/tiny_<timestamp>/
 
 # 5. Create a single synthetic input image and run full-image inference
 mkdir -p outputs/infer_input
-uv run python -c "
+python -c "
 import cv2, numpy as np
 rng = np.random.default_rng(42)
 img = rng.integers(0, 256, size=(512, 512), dtype=np.uint8)
 cv2.imwrite('outputs/infer_input/synth_4x.png', img)
 "
-uv run python -m spheroid_seg.infer --config configs/tiny.yaml \
+python -m spheroid_seg.infer --config configs/tiny.yaml \
     --input outputs/infer_input/
 #    → outputs/infer/tiny_<timestamp>/
 ```
@@ -95,14 +143,14 @@ Annotation format:
 When annotated real images arrive:
 
 1. Run QC:
-   `uv run python -m spheroid_seg.data.qc --raw-dir data/raw --mask-dir data/masks`
+   `python -m spheroid_seg.data.qc --raw-dir data/raw --mask-dir data/masks`
 2. Fill `data/metadata.csv` with at least `image,magnification` (optionally add
    `condition` for joint stratification).
 3. Create stratified splits:
-   `uv run python scripts/make_splits.py --config configs/base.yaml`
+   `python scripts/make_splits.py --config configs/base.yaml`
 4. Train and evaluate as usual:
-   `uv run python -m spheroid_seg.train --config configs/base.yaml`
-   `uv run python -m spheroid_seg.eval --config configs/base.yaml`
+   `python -m spheroid_seg.train --config configs/base.yaml`
+   `python -m spheroid_seg.eval --config configs/base.yaml`
 
 A public sample subset will be published on Zenodo once clinical-group approval
 is complete; `scripts/download_data.py` is currently a placeholder for that
@@ -122,7 +170,7 @@ future fetch step.
 ## Development
 
 See [`AGENTS.md`](AGENTS.md) for the project commands, conventions, and
-definition of done. The short version:
+definition of done. The short version, using uv:
 
 ```bash
 uv run pytest
