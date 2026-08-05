@@ -82,3 +82,17 @@ data/masks/  (annotation PNGs, IDs 0-3, same base name)
   grid (reproducible debugging).
 - The pipeline is framework-agnostic up to the batch: arrays come out as
   NumPy; JAX conversion happens in the training loop (M3).
+  
+## Annotation export (QuPath)
+
+`scripts/export_qupath_masks.groovy` rasterizes QuPath annotations into the
+mask PNGs expected in `data/masks/` (IDs: 0=background, 1=loose cell,
+2=spheroid, 3=organoid). Usage: open the image(s) in a QuPath project,
+paste the script into Automate → Script editor, Run (or Run for project).
+Class names must match exactly: `Loose cell`, `Spheroid`, `Organoid`.
+Notes:
+- Use area tools (ellipse/polygon/brush), never the points tool — lines
+  have no area and rasterize as near-zero pixels.
+- Every annotation must have its PathClass assigned (right-click → Set class).
+- Exported PNGs may be palette-based; convert to plain grayscale before QC.
+- Validate with qc.py before copying into data/masks/.
