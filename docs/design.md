@@ -45,6 +45,13 @@ Constraints: modest compute (single modest GPU), small proprietary dataset
 - **One PNG per image**, same base name and dimensions as the source image.
 - Pixel value = class ID: `0` = background, `1` = loose cell, `2` = spheroid, `3` = organoid.
 - Lossless grayscale PNG (uint8). Never JPEG for masks.
+- **File naming**: base names must end in `_4x` or `_10x` (e.g. `117 - 9d 3T3_4x.JPG`)
+  so magnification can be parsed for stratified splitting and per-magnification
+  metrics. Alternatively, magnification can be supplied via `data/metadata.csv`;
+  the filename suffix takes precedence.
+- **Export script**: `scripts/export_qupath_masks.groovy` rasterizes QuPath
+  annotations into spec-compliant masks (see `docs/data-pipeline.md` for usage
+  and annotation pitfalls).
 - Suggested tools: QuPath (preferred), napari, Fiji/ImageJ.
 - **Annotation protocol**: written spheroid-vs-organoid definitions with an example
   gallery including agreed borderline cases. *Pending: validate objective criteria

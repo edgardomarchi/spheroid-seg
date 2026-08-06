@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -78,3 +81,21 @@ def test_class_colormap_documented() -> None:
     assert set(CLASS_COLORMAP.keys()) == {0, 1, 2}
     for color in CLASS_COLORMAP.values():
         assert len(color) == 3
+
+
+def _load_visualize_batches():
+    script = Path(__file__).resolve().parent.parent / "scripts" / "visualize_batches.py"
+    spec = importlib.util.spec_from_file_location("visualize_batches", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_overlay_grayscale_float_image_is_visible():
+    """Regression: 2D float [0,1] images must be scaled to uint8, not truncated."""
+    _overlay = _load_visualize_batches()._overlay
+    image = np.full((64, 64), 0.6, dtype=np.float32)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    out = _overlay(image, mask)
+    assert out.dtype == np.uint8
+    assert out[0, 0].mean() > 50  # background renders near 0.6*255, not 0

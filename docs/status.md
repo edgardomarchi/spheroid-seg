@@ -4,14 +4,14 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-08-04 (after user docs and LICENSE).
+Last updated: 2026-08-06 (real-data onboarding started).
 
 ## Modules
 
 | Module | Status | Notes |
 |---|---|---|
 | M0 — Repo scaffolding | Done | uv + pyproject, src layout, ruff/pytest wired |
-| M1 — Data pipeline | Done | dataset, patching (mask-guided), augmentation, synthetic fixtures; see `docs/data-pipeline.md` |
+| M1 — Data pipeline | Done | dataset, patching (mask-guided), augmentation, synthetic fixtures; visual acceptance re-confirmed on 4 real annotated images; see `docs/data-pipeline.md` |
 | M2 — U-Net (Flax) | Done | from scratch, 7.7M params at base_features=32; BatchNorm `batch_stats` verified |
 | M3 — Training loop | Done | losses (Dice + weighted CE), metrics, TrainState + AdamW, unique run dirs, `--overfit-one-batch`; see `docs/training.md`. 48 tests green, ruff clean |
 | M4 — Evaluation CLI | Done | per-class Dice/IoU, confusion, overlays, per-magnification grouping, checkpoint resolution; see `docs/evaluation.md` |
@@ -41,6 +41,21 @@ Last updated: 2026-08-04 (after user docs and LICENSE).
 - **ROCm iGPU experiment outcome** (M5): `jax.devices()` only reports the CPU on
   the test machine's iGPU (gfx1152) under ROCm 7. Local development stays
   CPU-first; the GPU path remains Colab/cloud CUDA, as stated in the design doc.
+- **Real-data onboarding started** (2026-08-06): 4 annotated images (3× 10x,
+  1× 4x) exported from QuPath via `scripts/export_qupath_masks.groovy`, QC
+  passed, splits committed. Annotation pitfalls documented in
+  `docs/data-pipeline.md` (area tools only, PathClass required).
+- **Filename convention for real data**: base names end in `_4x`/`_10x`
+  (magnification parser contract, same as synthetic fixtures). To be
+  communicated to the clinical group for the full batch.
+- **Two bugfixes from the real-data visual check**: `_overlay()` now scales
+  grayscale float images to uint8 (image channel was truncated to black);
+  scale augmentation uses reflect border mode (no artificial black frames;
+  mask reflects consistently). Regression tests added.
+- **Split layout with n=4**: train = 2× 10x, val = 1× 10x + 1× 4x — train
+  temporarily has no 4x; accepted artifact of a too-small-to-stratify group,
+  resolves when the full batch arrives. `test.txt` intentionally empty;
+  `eval --split test` fails cleanly ("No images found for split 'test'").
 
 ## Pending — v0.1 public release
 
@@ -50,6 +65,8 @@ Last updated: 2026-08-04 (after user docs and LICENSE).
   (impractical on CPU; smoke-config substitute passed).
 - CI pipeline (GitHub Actions) covering Python 3.12/3.13/3.14.
 - Zenodo sample publication + `scripts/download_data.py` fetch step.
+- Real annotated data: first 4 images wired and validated; awaiting the full
+  clinical batch (~80–100) and the first real train/val leak check.
 
 ## Pending — technical
 
@@ -59,6 +76,9 @@ Last updated: 2026-08-04 (after user docs and LICENSE).
   done; what remains is the arrival of the first batch of annotated images and
   the first real train/val leak check.
 - Optional: `--seed` CLI override for `visualize_batches.py`.
+- Real-data wiring: done for the first 4 images (QC + splits + visual check).
+  Remaining: full-batch ingestion via `scripts/make_splits.py` and the first
+  real train/val leak check when the clinical batch arrives.
 
 ## Pending — clinical group
 

@@ -139,6 +139,9 @@ Annotation format:
   - `3` = organoid
 - The model trains with 3 classes: IDs `2` and `3` are merged in memory as
   "aggregate" (the original PNGs are left untouched).
+- Raw images and masks must share the same base name, ending in `_4x` or `_10x`
+  (magnification is parsed from the filename for stratification and
+  per-magnification metrics; `data/metadata.csv` can override it).
 
 When annotated real images arrive:
 

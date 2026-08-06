@@ -54,3 +54,15 @@ def test_augmentation_preserves_mask_classes(augment_config: dict) -> None:
     _, aug_mask = apply_augmentation(transform, image, mask)
 
     assert set(np.unique(aug_mask)).issubset({0, 1, 2})
+
+
+def test_affine_scale_out_reflects_image_and_mask_consistently():
+    """Regression: scale-out must reflect-pad (no black borders); the mask
+    reflects with the image so labels stay consistent."""
+    config = {"scale_probability": 1.0, "scale_range": [0.5, 0.5]}
+    transform = build_augmentation(config, seed=42)
+    image = np.full((128, 128), 200, dtype=np.uint8)
+    mask = np.full((128, 128), 1, dtype=np.uint8)
+    aug_img, aug_mask = apply_augmentation(transform, image, mask)
+    assert aug_img[0, 0] > 100   # corners stay bright (no black padding)
+    assert aug_mask[0, 0] == 1   # mask reflected consistently with the image
