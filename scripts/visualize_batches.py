@@ -74,10 +74,8 @@ def _colorize_mask(mask: np.ndarray) -> np.ndarray:
 
 def _overlay(image: np.ndarray, mask: np.ndarray, alpha: float = 0.4) -> np.ndarray:
     """Overlay a colorized mask on a grayscale image."""
-    if image.ndim == 2:
-        image_rgb = np.stack([image] * 3, axis=-1)
-    else:
-        image_rgb = (image * 255).clip(0, 255).astype(np.uint8)
+    image_u8 = (image * 255).clip(0, 255).astype(np.uint8)
+    image_rgb = np.stack([image_u8] * 3, axis=-1) if image_u8.ndim == 2 else image_u8
 
     colored = _colorize_mask(mask)
     blended = (alpha * colored + (1 - alpha) * image_rgb).astype(np.uint8)

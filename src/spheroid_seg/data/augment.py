@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import albumentations as A  # noqa: N812
+import cv2
 import numpy as np
 
 
@@ -38,6 +39,8 @@ def build_augmentation(config: dict[str, Any], seed: int | None = None) -> A.Com
             scale=scale_range,
             keep_ratio=True,
             p=config.get("scale_probability", 0.5),
+            border_mode=cv2.BORDER_REFLECT_101,
+            fill=0,
         ),
         A.GaussianBlur(
             blur_limit=tuple(config.get("blur_limit", [3, 7])),
