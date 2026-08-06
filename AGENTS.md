@@ -21,6 +21,7 @@ conventions and commands; do not duplicate design content here.
 - Setup: `uv sync --all-groups`
 - Tests: `uv run pytest`
 - Lint/format: `uv run ruff check . && uv run ruff format .`
+- CI: on every push/PR to `main`, GitHub Actions runs `ruff check`, `ruff format --check`, and `pytest` across Python 3.12/3.13/3.14.
 - Train: `uv run python -m spheroid_seg.train --config configs/base.yaml`
 - Eval: `uv run python -m spheroid_seg.eval --config configs/base.yaml`
 

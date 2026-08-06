@@ -16,6 +16,7 @@ Last updated: 2026-08-06 (real-data onboarding started).
 | M3 — Training loop | Done | losses (Dice + weighted CE), metrics, TrainState + AdamW, unique run dirs, `--overfit-one-batch`; see `docs/training.md`. 48 tests green, ruff clean |
 | M4 — Evaluation CLI | Done | per-class Dice/IoU, confusion, overlays, per-magnification grouping, checkpoint resolution; see `docs/evaluation.md` |
 | M5 — Inference (stitching) | Done | full-image patch stitching with logit averaging; see `docs/inference.md` |
+| CI — GitHub Actions | Done | lint + `pytest` matrix on Python 3.12/3.13/3.14; see `.github/workflows/ci.yml` |
 | M6 — Post-processing (v0.2) | Pending | instances, morphometrics, hybrid spheroid/organoid classification |
 | M7 — SLiMIA pre-training | Deferred | domain-shift risk; only if own data underperforms |
 
@@ -63,10 +64,12 @@ Last updated: 2026-08-06 (real-data onboarding started).
   the first real train/val leak check.
 - Full `configs/base.yaml --overfit-one-batch` acceptance check on GPU/Colab
   (impractical on CPU; smoke-config substitute passed).
-- CI pipeline (GitHub Actions) covering Python 3.12/3.13/3.14.
 - Zenodo sample publication + `scripts/download_data.py` fetch step.
 - Real annotated data: first 4 images wired and validated; awaiting the full
   clinical batch (~80–100) and the first real train/val leak check.
+- **Manual maintainer step after the first green CI run on `main`:** enable branch
+  protection for `main` requiring the `lint` and `test` status checks to pass
+  before merging (GitHub Settings → Branches → add rule for `main`).
 
 ## Pending — technical
 
