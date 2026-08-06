@@ -1,5 +1,7 @@
 # spheroid-seg
 
+[![CI](https://github.com/edgardomarchi/spheroid-seg/actions/workflows/ci.yml/badge.svg)](https://github.com/edgardomarchi/spheroid-seg/actions/workflows/ci.yml)
+
 Open-source pipeline for segmenting spheroids and loose cells in phase-contrast
 microscopy images (4x and 10x). Version 0.1 trains a single U-Net in JAX/Flax
 for 3-class semantic segmentation:
