@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from spheroid_seg.overlays import CLASS_COLORMAP, build_overlay_grid
 
@@ -99,3 +101,38 @@ def test_overlay_grayscale_float_image_is_visible():
     out = _overlay(image, mask)
     assert out.dtype == np.uint8
     assert out[0, 0].mean() > 50  # background renders near 0.6*255, not 0
+
+
+class _MatplotlibBlocker:
+    """Meta-path finder that makes matplotlib (and its submodules) unimportable."""
+
+    def find_spec(self, name: str, path: object = None, target: object = None) -> object:
+        if name == "matplotlib" or name.startswith("matplotlib."):
+            spec = importlib.util.spec_from_loader(name, self)
+            return spec
+        return None
+
+    def create_module(self, spec: object) -> None:
+        return None
+
+    def exec_module(self, module: object) -> None:
+        raise ModuleNotFoundError(f"No module named {module.__name__!r}")
+
+
+def test_visualize_batches_requires_matplotlib_for_plotting() -> None:
+    """The plotting path raises a clear error when matplotlib is unavailable."""
+    real_modules = sys.modules.copy()
+    for name in list(sys.modules):
+        if name.startswith("matplotlib"):
+            del sys.modules[name]
+
+    blocker = _MatplotlibBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        module = _load_visualize_batches()
+        with pytest.raises(ModuleNotFoundError, match="uv sync --all-groups"):
+            module._get_pyplot()
+    finally:
+        sys.meta_path.remove(blocker)
+        sys.modules.clear()
+        sys.modules.update(real_modules)

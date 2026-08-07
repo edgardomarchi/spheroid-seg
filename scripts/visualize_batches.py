@@ -10,15 +10,27 @@ from __future__ import annotations
 import argparse
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
 from spheroid_seg.data.augment import apply_augmentation, build_augmentation
 from spheroid_seg.data.dataset import SpheroidDataset
 from spheroid_seg.data.patching import extract_patches
+
+
+def _get_pyplot() -> Any:
+    """Import matplotlib.pyplot lazily and fail with a helpful message."""
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required for visualization. "
+            "Install the notebook dependency group: uv sync --all-groups"
+        ) from exc
+    return plt
 
 
 def _synthetic_fixture_dir(tmp_dir: Path, n_images: int = 4) -> tuple[Path, Path]:
@@ -153,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
 
     n_cols = 4
     n_rows = (args.n_samples + n_cols - 1) // n_cols
+    plt = _get_pyplot()
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3))
     axes = np.atleast_1d(axes).reshape(n_rows, n_cols)
 
