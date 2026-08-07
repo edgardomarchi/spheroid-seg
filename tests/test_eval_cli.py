@@ -12,6 +12,8 @@ import numpy as np
 import pytest
 import yaml
 
+from spheroid_seg.data.synthetic import write_synthetic_pair
+
 
 def _write_config(tmp_path: Path, base_config: Path, overrides: dict | None = None) -> Path:
     """Copy a base config into a temp dir, optionally overriding keys."""
@@ -179,3 +181,109 @@ def test_eval_cli_config_checkpoint_mismatch(
     result = _run_eval(bad_config_path, split="val", checkpoint=str(checkpoint_path))
     assert result.returncode != 0
     assert "incompatible" in result.stderr.lower() or "shape" in result.stderr.lower()
+
+
+def test_synthetic_fallback_with_committed_splits_no_real_data(tmp_path: Path) -> None:
+    """Committed split files are ignored when no real raw/mask pairs exist.
+
+    Regression test for the bug where ``data/splits/*.txt`` are committed and
+    reference real image names, but on a clean checkout (CI, fresh clone) no
+    real raw/mask pairs are present. In that case the pipeline must fall back
+    to the synthetic dataset and its internal split, ignoring the split files.
+    """
+    data_dir = tmp_path / "data"
+    splits_dir = data_dir / "splits"
+    splits_dir.mkdir(parents=True)
+
+    # Duplicate names across train/val would trigger the leak detector if the
+    # split files were read, so training success proves they were ignored.
+    (splits_dir / "train.txt").write_text("committed_missing_4x\n")
+    (splits_dir / "val.txt").write_text("committed_missing_4x\n")
+    (splits_dir / "test.txt").write_text("committed_missing_10x\n")
+
+    # raw/mask dirs are intentionally absent.
+    config_path = _write_config(
+        tmp_path,
+        Path("configs/tiny.yaml"),
+        overrides={
+            "data": {
+                "raw_dir": str(data_dir / "raw"),
+                "masks_dir": str(data_dir / "masks"),
+                "splits_dir": str(splits_dir),
+                "slimia_dir": str(data_dir / "slimia"),
+            },
+            "synthetic_n_images": 8,
+        },
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "spheroid_seg.train",
+            "--config",
+            str(config_path),
+            "--epochs",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    combined_output = result.stdout + result.stderr
+    assert "synthetic" in combined_output.lower()
+    assert "ignored" in combined_output.lower() or "no real" in combined_output.lower()
+
+    config = yaml.safe_load(config_path.read_text())
+    runs_dir = Path(config["outputs"]["checkpoints_dir"]).parent / "runs"
+    run_dirs = sorted(runs_dir.glob(f"{config_path.stem}_*"), key=lambda p: p.stat().st_mtime)
+    assert run_dirs, "No training run directory was created"
+    run_dir = run_dirs[-1]
+
+    eval_result = _run_eval(config_path, split="val", run_dir=str(run_dir))
+    assert eval_result.returncode == 0, eval_result.stderr
+
+
+def test_real_data_without_splits_raises_clear_error(tmp_path: Path) -> None:
+    """Real raw/mask pairs without split files produce a clear error."""
+    data_dir = tmp_path / "data"
+    raw_dir = data_dir / "raw"
+    masks_dir = data_dir / "masks"
+    raw_dir.mkdir(parents=True)
+    masks_dir.mkdir(parents=True)
+
+    # Create a valid raw/mask pair but omit split files.
+    write_synthetic_pair(raw_dir, masks_dir, "real_4x", shape=(128, 128))
+
+    config_path = _write_config(
+        tmp_path,
+        Path("configs/tiny.yaml"),
+        overrides={
+            "data": {
+                "raw_dir": str(raw_dir),
+                "masks_dir": str(masks_dir),
+                "splits_dir": str(data_dir / "splits"),
+                "slimia_dir": str(data_dir / "slimia"),
+            },
+        },
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "spheroid_seg.train",
+            "--config",
+            str(config_path),
+            "--epochs",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    combined_output = result.stdout + result.stderr
+    assert "split files" in combined_output.lower()

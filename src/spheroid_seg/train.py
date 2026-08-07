@@ -20,7 +20,7 @@ import yaml
 from flax.training import train_state
 
 from spheroid_seg.data.augment import apply_augmentation, build_augmentation
-from spheroid_seg.data.dataset import SpheroidDataset
+from spheroid_seg.data.dataset import SpheroidDataset, has_real_pairs
 from spheroid_seg.data.patching import extract_patches
 from spheroid_seg.data.synthetic import generate_synthetic_dataset, synthetic_split_names
 from spheroid_seg.losses import segmentation_loss
@@ -40,21 +40,17 @@ def load_config(path: Path) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def _ensure_data_dirs(config: dict[str, Any], tmp_dir: Path) -> tuple[Path, Path]:
-    """Return existing raw/mask dirs or generate a synthetic fallback dataset."""
+def _ensure_data_dirs(config: dict[str, Any], tmp_dir: Path) -> tuple[Path, Path, bool]:
+    """Return raw/mask dirs and whether real pairs were found.
+
+    If no valid raw/mask pairs exist, a synthetic fallback dataset is generated
+    in ``tmp_dir`` and the returned flag is ``False``.
+    """
     raw_dir = Path(config["data"]["raw_dir"])
     masks_dir = Path(config["data"]["masks_dir"])
 
-    image_suffixes = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-    has_raw = raw_dir.exists() and any(
-        p.suffix.lower() in image_suffixes for p in raw_dir.iterdir()
-    )
-    has_masks = masks_dir.exists() and any(
-        p.suffix.lower() in image_suffixes for p in masks_dir.iterdir()
-    )
-
-    if has_raw and has_masks:
-        return raw_dir, masks_dir
+    if has_real_pairs(raw_dir, masks_dir):
+        return raw_dir, masks_dir, True
 
     print(
         f"No real data found in '{raw_dir}' / '{masks_dir}'. "
@@ -62,13 +58,14 @@ def _ensure_data_dirs(config: dict[str, Any], tmp_dir: Path) -> tuple[Path, Path
     )
     synth_raw = tmp_dir / "raw"
     synth_masks = tmp_dir / "masks"
-    return generate_synthetic_dataset(
+    synth_raw_dir, synth_masks_dir = generate_synthetic_dataset(
         synth_raw,
         synth_masks,
         n_images=config.get("synthetic_n_images", 16),
         shape=config.get("synthetic_image_shape", (512, 512)),
         seed=config["seed"],
     )
+    return synth_raw_dir, synth_masks_dir, False
 
 
 def _build_patch_arrays(
@@ -297,10 +294,8 @@ def train(
     jax_rng = jax.random.PRNGKey(seed)
 
     with tempfile.TemporaryDirectory() as tmp:
-        raw_dir, masks_dir = _ensure_data_dirs(config, Path(tmp))
+        raw_dir, masks_dir, has_real = _ensure_data_dirs(config, Path(tmp))
 
-        # Use all synthetic data as train; reserve a validation subset by reusing
-        # a fresh synthetic dataset if no real splits exist.
         splits_dir = Path(config["data"]["splits_dir"])
         train_dataset = SpheroidDataset(
             raw_dir,
@@ -309,8 +304,15 @@ def train(
             class_mapping=config["class_mapping"],
         )
 
-        if splits_dir.exists() and any(splits_dir.glob("*.txt")):
-            # Future path: load real train/val splits.
+        if has_real:
+            # Real-data mode: split files are required and authoritative.
+            if not splits_dir.exists() or not any(splits_dir.glob("*.txt")):
+                raise ValueError(
+                    f"Real raw/mask pairs found in '{raw_dir}' / '{masks_dir}' "
+                    f"but no split files in '{splits_dir}'. "
+                    "Create splits with scripts/make_splits.py."
+                )
+
             from spheroid_seg.data.splits import load_splits
 
             splits = load_splits(splits_dir)
@@ -323,6 +325,16 @@ def train(
                 val_pairs, raw_dir, masks_dir, config["input_channels"], config["class_mapping"]
             )
         else:
+            # Synthetic fallback: ignore committed split files when no real pairs
+            # are present, but warn so the behavior is explicit on clean checkouts.
+            if splits_dir.exists() and any(splits_dir.glob("*.txt")):
+                print(
+                    f"WARNING: committed split files exist in '{splits_dir}' "
+                    f"but no real raw/mask pairs were found in "
+                    f"'{config['data']['raw_dir']}' / '{config['data']['masks_dir']}'; "
+                    "ignoring split files and using the synthetic fallback dataset."
+                )
+
             # Smoke-test path: use the deterministic, magnification-stratified
             # synthetic split shared with eval.py.
             n_images = config.get("synthetic_n_images", 16)
