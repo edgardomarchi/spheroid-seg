@@ -18,7 +18,7 @@ import numpy as np
 import yaml
 
 from spheroid_seg.checkpoints import resolve_checkpoint
-from spheroid_seg.data.dataset import load_pair
+from spheroid_seg.data.dataset import has_real_pairs, load_pair
 from spheroid_seg.data.metadata import parse_magnification
 from spheroid_seg.data.splits import load_split_list
 from spheroid_seg.data.synthetic import generate_synthetic_dataset, synthetic_split_names
@@ -117,18 +117,11 @@ def _load_split_samples(
     masks_dir = Path(config["data"]["masks_dir"])
     splits_dir = Path(config["data"]["splits_dir"])
 
-    has_raw = raw_dir.exists() and any(
-        p.suffix.lower() in IMAGE_EXTENSIONS for p in raw_dir.iterdir()
-    )
-    has_masks = masks_dir.exists() and any(
-        p.suffix.lower() in IMAGE_EXTENSIONS for p in masks_dir.iterdir()
-    )
-
     input_channels = config["input_channels"]
     class_mapping = config["class_mapping"]
     samples: list[tuple[np.ndarray, np.ndarray, str]] = []
 
-    if has_raw and has_masks:
+    if has_real_pairs(raw_dir, masks_dir):
         names = load_split_list(splits_dir, split)
         for name in names:
             raw_path = _find_file_with_stem(raw_dir, name)

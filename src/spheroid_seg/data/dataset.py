@@ -13,6 +13,32 @@ import tifffile
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 
+def has_real_pairs(raw_dir: Path | str, masks_dir: Path | str) -> bool:
+    """Return True if at least one raw/mask pair with matching stem exists.
+
+    Split files alone do not constitute real data; this checks for actual
+    image files in ``raw_dir`` and ``masks_dir`` that share the same base name.
+    """
+    raw_dir = Path(raw_dir)
+    masks_dir = Path(masks_dir)
+    if not raw_dir.exists() or not masks_dir.exists():
+        return False
+
+    raw_by_stem: dict[str, Path] = {}
+    for path in raw_dir.iterdir():
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            raw_by_stem[path.stem] = path
+
+    if not raw_by_stem:
+        return False
+
+    return any(
+        path.stem in raw_by_stem
+        for path in masks_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
 def _read_image(path: Path) -> np.ndarray:
     """Read an image file, returning an HxW grayscale or HxW[xC] array."""
     suffix = path.suffix.lower()
