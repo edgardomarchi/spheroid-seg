@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from spheroid_seg.train import create_train_state, train_step
+from spheroid_seg.train import create_train_state, load_config, train, train_step
 
 
 def _fixed_batch(
@@ -50,3 +53,49 @@ def test_train_step_reduces_loss() -> None:
         losses.append(float(step_loss))
 
     assert losses[-1] < losses[0]
+
+
+def test_synthetic_training_does_not_diverge(tmp_path: Path) -> None:
+    """Synthetic fallback training stays stable: val loss does not explode.
+
+    Regression test for the train/validation divergence bug where BatchNorm
+    running statistics lagged the batch statistics used during training,
+    causing validation metrics to degrade while training loss decreased.
+    """
+    config = load_config(Path("configs/tiny.yaml"))
+
+    # Force the synthetic fallback path and use a small batch / down-weighted
+    # background to reproduce the eval-mode BatchNorm mismatch on CPU.
+    empty_raw = tmp_path / "raw"
+    empty_masks = tmp_path / "masks"
+    empty_raw.mkdir()
+    empty_masks.mkdir()
+    config["data"]["raw_dir"] = str(empty_raw)
+    config["data"]["masks_dir"] = str(empty_masks)
+
+    config["batch_size"] = 2
+    config["class_weights"] = [0.1, 1.0, 1.0]
+    config["synthetic_n_images"] = 8
+    config["patches_per_image"] = 8
+    config["early_stopping_patience"] = 20
+
+    run_dir = tmp_path / "run"
+    train(config, run_dir=run_dir, epochs_override=5)
+
+    log_path = run_dir / "logs" / "train_log.csv"
+    rows = list(csv.DictReader(log_path.open("r", newline="")))
+    assert len(rows) == 5
+
+    initial_train_loss = float(rows[0]["train_loss"])
+    final_train_loss = float(rows[-1]["train_loss"])
+    initial_val_loss = float(rows[0]["val_loss"])
+    final_val_loss = float(rows[-1]["val_loss"])
+    final_bg_dice = float(rows[-1]["dice_class_0"])
+
+    assert final_train_loss < initial_train_loss, (
+        f"Training loss did not decrease: {initial_train_loss:.4f} -> {final_train_loss:.4f}"
+    )
+    assert final_val_loss < 2 * initial_val_loss, (
+        f"Validation loss diverged: {initial_val_loss:.4f} -> {final_val_loss:.4f}"
+    )
+    assert final_bg_dice > 0.5, f"Background Dice collapsed: {final_bg_dice:.4f}"

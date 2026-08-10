@@ -5,6 +5,7 @@
 num_classes: 3
 patch_size: 512
 base_features: 32
+bn_momentum: 0.9
 
 # Optimization
 lr: 1.0e-3

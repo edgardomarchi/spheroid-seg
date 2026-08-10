@@ -33,17 +33,18 @@ configs/*.yaml ──► train.py ──► dataset + patching + augment (data p
     `data/raw` / `data/masks`;
   - `flax.training.train_state.TrainState` + `optax.adamw` with cosine decay;
   - BatchNorm statistics are carried in the mutable `batch_stats` collection
-    and updated with `train=True`;
+    and updated with `train=True`; the momentum is exposed as `bn_momentum`
+    in the config so running statistics can be tuned for small batches.
   - logs every epoch to CSV and saves checkpoints; the checkpoint with the
     highest mean validation Dice is kept as best.
 
 ## Configurations
 
-| Config | Patch | Base features | Purpose |
-|---|---|---|---|
-| `configs/smoke.yaml` | small | small | fastest sanity checks (overfit-one-batch, CI) |
-| `configs/tiny.yaml` | 128 | 16 | short CPU trainings, pipeline verification |
-| `configs/base.yaml` | 512 | 32 | full model (7.7M params); intended for GPU |
+| Config | Patch | Base features | BN momentum | Purpose |
+|---|---|---|---|---|
+| `configs/smoke.yaml` | small | small | 0.9 | fastest sanity checks (overfit-one-batch, CI) |
+| `configs/tiny.yaml` | 128 | 16 | 0.9 | short CPU trainings, pipeline verification |
+| `configs/base.yaml` | 512 | 32 | 0.9 | full model (7.7M params); intended for GPU |
 
 All tests and smoke checks must pass on CPU-only machines; `base.yaml`
 training is expected to run on GPU or Colab.

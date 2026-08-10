@@ -149,6 +149,7 @@ def create_train_state(
         num_classes=config["num_classes"],
         base_features=config["base_features"],
         input_channels=config["input_channels"],
+        bn_momentum=config.get("bn_momentum", 0.99),
     )
     channels = 1 if config["input_channels"] == "grayscale" else 3
     patch_size = config["patch_size"]

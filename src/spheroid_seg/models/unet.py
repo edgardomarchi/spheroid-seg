@@ -28,13 +28,14 @@ class ConvBlock(nn.Module):
 
     features: int
     train: bool
+    bn_momentum: float = 0.99
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         """Apply the convolutional block."""
         for _ in range(2):
             x = nn.Conv(features=self.features, kernel_size=(3, 3), padding="SAME")(x)
-            x = nn.BatchNorm(use_running_average=not self.train)(x)
+            x = nn.BatchNorm(use_running_average=not self.train, momentum=self.bn_momentum)(x)
             x = nn.relu(x)
         return x
 
@@ -51,6 +52,7 @@ class UNet(nn.Module):
     num_classes: int = 3
     base_features: int = 32
     input_channels: str = "grayscale"
+    bn_momentum: float = 0.99
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = False) -> jnp.ndarray:
@@ -84,45 +86,59 @@ class UNet(nn.Module):
             )
 
         # Encoder
-        e0 = ConvBlock(features=self.base_features, train=train)(x)
+        e0 = ConvBlock(features=self.base_features, train=train, bn_momentum=self.bn_momentum)(x)
         e1_in = nn.max_pool(e0, window_shape=(2, 2), strides=(2, 2))
 
-        e1 = ConvBlock(features=self.base_features * 2, train=train)(e1_in)
+        e1 = ConvBlock(features=self.base_features * 2, train=train, bn_momentum=self.bn_momentum)(
+            e1_in
+        )
         e2_in = nn.max_pool(e1, window_shape=(2, 2), strides=(2, 2))
 
-        e2 = ConvBlock(features=self.base_features * 4, train=train)(e2_in)
+        e2 = ConvBlock(features=self.base_features * 4, train=train, bn_momentum=self.bn_momentum)(
+            e2_in
+        )
         e3_in = nn.max_pool(e2, window_shape=(2, 2), strides=(2, 2))
 
-        e3 = ConvBlock(features=self.base_features * 8, train=train)(e3_in)
+        e3 = ConvBlock(features=self.base_features * 8, train=train, bn_momentum=self.bn_momentum)(
+            e3_in
+        )
         e4_in = nn.max_pool(e3, window_shape=(2, 2), strides=(2, 2))
 
         # Bottleneck
-        bottleneck = ConvBlock(features=self.base_features * 16, train=train)(e4_in)
+        bottleneck = ConvBlock(
+            features=self.base_features * 16, train=train, bn_momentum=self.bn_momentum
+        )(e4_in)
 
         # Decoder
         d3 = nn.ConvTranspose(
             features=self.base_features * 8, kernel_size=(2, 2), strides=(2, 2), padding="SAME"
         )(bottleneck)
         d3 = jnp.concatenate([d3, e3], axis=-1)
-        d3 = ConvBlock(features=self.base_features * 8, train=train)(d3)
+        d3 = ConvBlock(features=self.base_features * 8, train=train, bn_momentum=self.bn_momentum)(
+            d3
+        )
 
         d2 = nn.ConvTranspose(
             features=self.base_features * 4, kernel_size=(2, 2), strides=(2, 2), padding="SAME"
         )(d3)
         d2 = jnp.concatenate([d2, e2], axis=-1)
-        d2 = ConvBlock(features=self.base_features * 4, train=train)(d2)
+        d2 = ConvBlock(features=self.base_features * 4, train=train, bn_momentum=self.bn_momentum)(
+            d2
+        )
 
         d1 = nn.ConvTranspose(
             features=self.base_features * 2, kernel_size=(2, 2), strides=(2, 2), padding="SAME"
         )(d2)
         d1 = jnp.concatenate([d1, e1], axis=-1)
-        d1 = ConvBlock(features=self.base_features * 2, train=train)(d1)
+        d1 = ConvBlock(features=self.base_features * 2, train=train, bn_momentum=self.bn_momentum)(
+            d1
+        )
 
         d0 = nn.ConvTranspose(
             features=self.base_features, kernel_size=(2, 2), strides=(2, 2), padding="SAME"
         )(d1)
         d0 = jnp.concatenate([d0, e0], axis=-1)
-        d0 = ConvBlock(features=self.base_features, train=train)(d0)
+        d0 = ConvBlock(features=self.base_features, train=train, bn_momentum=self.bn_momentum)(d0)
 
         # Head
         logits = nn.Conv(features=self.num_classes, kernel_size=(1, 1), padding="SAME")(d0)

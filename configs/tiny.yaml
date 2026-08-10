@@ -3,6 +3,7 @@
 num_classes: 3
 patch_size: 128
 base_features: 16
+bn_momentum: 0.9
 
 lr: 1.0e-3
 weight_decay: 1.0e-4
