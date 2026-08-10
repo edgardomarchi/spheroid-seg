@@ -33,17 +33,18 @@ configs/*.yaml ──► train.py ──► dataset + patching + augment (data p
     `data/raw` / `data/masks`;
   - `flax.training.train_state.TrainState` + `optax.adamw` with cosine decay;
   - BatchNorm statistics are carried in the mutable `batch_stats` collection
-    and updated with `train=True`;
+    and updated with `train=True`; the momentum is exposed as `bn_momentum`
+    in the config so running statistics can be tuned for small batches.
   - logs every epoch to CSV and saves checkpoints; the checkpoint with the
     highest mean validation Dice is kept as best.
 
 ## Configurations
 
-| Config | Patch | Base features | Purpose |
-|---|---|---|---|
-| `configs/smoke.yaml` | small | small | fastest sanity checks (overfit-one-batch, CI) |
-| `configs/tiny.yaml` | 128 | 16 | short CPU trainings, pipeline verification |
-| `configs/base.yaml` | 512 | 32 | full model (7.7M params); intended for GPU |
+| Config | Patch | Base features | BN momentum | Purpose |
+|---|---|---|---|---|
+| `configs/smoke.yaml` | small | small | 0.9 | fastest sanity checks (overfit-one-batch, CI) |
+| `configs/tiny.yaml` | 128 | 16 | 0.9 | short CPU trainings, pipeline verification |
+| `configs/base.yaml` | 512 | 32 | 0.9 | full model (7.7M params); intended for GPU |
 
 All tests and smoke checks must pass on CPU-only machines; `base.yaml`
 training is expected to run on GPU or Colab.
@@ -63,6 +64,33 @@ uv run python -m spheroid_seg.train --config configs/smoke.yaml --overfit-one-ba
 
 Every invocation writes to a unique `outputs/runs/<config>_<timestamp>/`
 directory, so runs never overwrite each other. `outputs/` is gitignored.
+
+## Cloud GPU (Colab)
+
+`configs/base.yaml` (512² patches, 7.7M parameters) is impractical on CPU. A
+free Colab T4 runtime is enough to run it.
+
+Open the notebook directly:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/edgardomarchi/spheroid-seg/blob/main/notebooks/colab_training.ipynb)
+
+What the notebook does, in order:
+
+1. Checks `nvidia-smi` and clones the repo.
+2. Installs uv and runs `uv sync --extra cuda12 --group dev` inside the clone
+   (the Colab kernel stays stock).
+3. Verifies JAX reports a `CudaDevice`.
+4. Runs `uv run pytest -q` as a clean-room reproducibility check.
+5. Runs the pending M3 acceptance check:
+   `uv run python -m spheroid_seg.train --config configs/base.yaml --overfit-one-batch`
+   — loss should fall to near-zero.
+6. Optionally runs a few epochs of full `configs/base.yaml` training on the
+   synthetic fallback to measure GPU throughput.
+7. Zips the latest run under `outputs/runs/base_*/` and downloads it, because
+   Colab sessions can be cut at any time.
+
+For real-data training, uncomment the Drive-mount cell and copy your `data/`
+directory into the clone before training.
 
 ## Determinism
 

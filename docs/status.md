@@ -4,7 +4,7 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-08-06 (real-data onboarding started).
+Last updated: 2026-08-07 (Colab GPU notebook added).
 
 ## Modules
 
@@ -42,6 +42,11 @@ Last updated: 2026-08-06 (real-data onboarding started).
 - **ROCm iGPU experiment outcome** (M5): `jax.devices()` only reports the CPU on
   the test machine's iGPU (gfx1152) under ROCm 7. Local development stays
   CPU-first; the GPU path remains Colab/cloud CUDA, as stated in the design doc.
+- **Colab GPU notebook** (cloud workflow): `notebooks/colab_training.ipynb`
+  added to implement design doc §5 (clone + uv sync + GPU check + pytest +
+  `base.yaml --overfit-one-batch` + checkpoint download). The notebook drives
+  all commands through subprocesses so the Colab kernel stays stock. Actual GPU
+  execution is a manual maintainer verification step.
 - **Real-data onboarding started** (2026-08-06): 4 annotated images (3× 10x,
   1× 4x) exported from QuPath via `scripts/export_qupath_masks.groovy`, QC
   passed, splits committed. Annotation pitfalls documented in
@@ -63,7 +68,9 @@ Last updated: 2026-08-06 (real-data onboarding started).
 - Real annotated data: first batch of masks per spec in `docs/design.md` §2.2 and
   the first real train/val leak check.
 - Full `configs/base.yaml --overfit-one-batch` acceptance check on GPU/Colab
-  (impractical on CPU; smoke-config substitute passed).
+  (impractical on CPU; smoke-config substitute passed). The Colab notebook at
+  `notebooks/colab_training.ipynb` now contains the cell; actual GPU execution
+  is the maintainer's manual verification step.
 - Zenodo sample publication + `scripts/download_data.py` fetch step.
 - Real annotated data: first 4 images wired and validated; awaiting the full
   clinical batch (~80–100) and the first real train/val leak check.
@@ -74,7 +81,12 @@ Last updated: 2026-08-06 (real-data onboarding started).
 ## Pending — technical
 
 - Run the full `configs/base.yaml --overfit-one-batch` acceptance check on
-  GPU/Colab (impractical on CPU; smoke-config substitute passed).
+  GPU/Colab (impractical on CPU; smoke-config substitute passed). The Colab
+  notebook is ready; execution verification is the maintainer's manual step.
+- `train.py` resume-from-checkpoint: design doc §5 says training must be
+  resumable because cloud sessions can be cut, but `train.py` only saves
+  checkpoints and has no `--resume` path. Implement loading an existing
+  checkpoint and continuing training (CLI argument + state restoration).
 - Real-data wiring: the stratified split script (`scripts/make_splits.py`) is
   done; what remains is the arrival of the first batch of annotated images and
   the first real train/val leak check.
