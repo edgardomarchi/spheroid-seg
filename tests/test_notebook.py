@@ -161,3 +161,62 @@ def test_notebook_subprocess_calls_use_explicit_cwd_or_absolute_paths() -> None:
             raise AssertionError(
                 f"Cell {idx}: subprocess.run lacks cwd=REPO and is not an exempt call"
             )
+
+
+def _subprocess_run_calls(source: str) -> list[ast.Call]:
+    """Return all subprocess.run(...) calls in the source."""
+    tree = ast.parse(source)
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "subprocess"
+            and func.attr == "run"
+        ):
+            calls.append(node)
+    return calls
+
+
+def _call_targets_nvidia_smi(node: ast.Call) -> bool:
+    """Return True if the subprocess.run call is the GPU detection check."""
+    first_arg = node.args[0] if node.args else None
+    if not isinstance(first_arg, ast.List):
+        return False
+    cmd_parts = [
+        elt.value
+        for elt in first_arg.elts
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+    ]
+    return "nvidia-smi" in cmd_parts
+
+
+def test_notebook_command_cells_use_streaming_helper() -> None:
+    """All command invocations go through the streaming run() helper.
+
+    The only allowed subprocess.run call is the one-off GPU detection in the
+    setup cell; everything else must use the helper so output is streamed live.
+    """
+    for idx, source in _code_sources():
+        for node in _subprocess_run_calls(source):
+            assert _call_targets_nvidia_smi(node), (
+                f"Cell {idx}: bare subprocess.run call found; "
+                "route repo commands through the run() helper"
+            )
+
+
+def test_notebook_defines_streaming_run_helper() -> None:
+    """The notebook defines a streaming run() helper that uses subprocess.Popen."""
+    sources = "".join(source for _idx, source in _code_sources())
+    assert "def run(" in sources
+    assert "subprocess.Popen" in sources
+
+
+def test_notebook_plot_cell_reads_train_log_csv() -> None:
+    """The training-curves cell reads the per-run train_log.csv."""
+    sources = "".join(source for _idx, source in _code_sources())
+    assert "train_log.csv" in sources
+    assert "matplotlib.pyplot" in sources
