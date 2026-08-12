@@ -220,3 +220,157 @@ def test_notebook_plot_cell_reads_train_log_csv() -> None:
     sources = "".join(source for _idx, source in _code_sources())
     assert "train_log.csv" in sources
     assert "matplotlib.pyplot" in sources
+
+
+def _drive_code_cell_index() -> int:
+    """Return the index of the Drive data-loading code cell."""
+    for idx, source in _code_sources():
+        if "USE_DRIVE_DATA" in source and "shutil.copytree" in source:
+            return idx
+    raise AssertionError("Drive data-loading code cell not found")
+
+
+def _first_training_cell_index() -> int:
+    """Return the index of the first code cell that invokes training."""
+    for idx, source in _code_sources():
+        if "spheroid_seg.train" in source:
+            return idx
+    raise AssertionError("No training code cell found")
+
+
+def test_notebook_has_drive_data_cell_before_training() -> None:
+    """The Drive-loading cell exists and is positioned before any training cell."""
+    drive_idx = _drive_code_cell_index()
+    train_idx = _first_training_cell_index()
+    assert drive_idx < train_idx, (
+        f"Drive cell ({drive_idx}) must appear before first training cell ({train_idx})"
+    )
+
+
+def test_notebook_drive_cell_is_gated_by_flag() -> None:
+    """The Drive-loading cell is gated by a USE_DRIVE_DATA-style flag."""
+    idx = _drive_code_cell_index()
+    source = dict(_code_sources())[idx]
+    assert "USE_DRIVE_DATA" in source
+    # Flag is defined at the top of the notebook with a default of False.
+    setup_source = next(source for _idx, source in _code_sources())
+    assert "USE_DRIVE_DATA = False" in setup_source
+
+
+def test_notebook_drive_cell_uses_copytree() -> None:
+    """The Drive-loading cell copies data with shutil.copytree(..., dirs_exist_ok=True)."""
+    idx = _drive_code_cell_index()
+    source = dict(_code_sources())[idx]
+    assert "shutil.copytree" in source
+    assert "dirs_exist_ok=True" in source
+
+
+def test_notebook_drive_cell_prints_sanity_check() -> None:
+    """The Drive-loading cell prints file counts and warns when data is missing."""
+    idx = _drive_code_cell_index()
+    source = dict(_code_sources())[idx]
+    assert 'REPO / "data" / "raw"' in source or "REPO / 'data' / 'raw'" in source
+    assert 'REPO / "data" / "masks"' in source or "REPO / 'data' / 'masks'" in source
+    assert "WARNING" in source
+    assert "DRIVE_DATA_DIR" in source
+
+
+def test_notebook_no_shell_command_uses_drive_paths() -> None:
+    """No shell invocation passes Drive paths through a shell string."""
+    drive_path_markers = ("/content/drive", "MyDrive", "Colab Notebooks")
+    for idx, source in _code_sources():
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                # Reject os.system outright.
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                    and func.attr == "system"
+                ):
+                    raise AssertionError(f"Cell {idx}: os.system is not allowed")
+
+                # Reject subprocess.run/Popen with a string command containing Drive markers.
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "subprocess"
+                    and func.attr in ("run", "Popen")
+                ):
+                    first_arg = node.args[0] if node.args else None
+                    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                        cmd = first_arg.value
+                        if any(marker in cmd for marker in drive_path_markers):
+                            raise AssertionError(
+                                f"Cell {idx}: subprocess.{func.attr} receives a Drive path string"
+                            )
+
+
+def test_configs_colab_yaml_matches_base() -> None:
+    """configs/colab.yaml equals base.yaml except for batch_size, which is 4."""
+    import yaml
+
+    base_path = REPO_ROOT / "configs" / "base.yaml"
+    colab_path = REPO_ROOT / "configs" / "colab.yaml"
+    assert colab_path.is_file(), "configs/colab.yaml does not exist"
+
+    base_cfg = yaml.safe_load(base_path.read_text())
+    colab_cfg = yaml.safe_load(colab_path.read_text())
+
+    assert colab_cfg.get("batch_size") == 4, "colab.yaml batch_size must be 4"
+
+    # Compare all keys except batch_size.
+    base_copy = {k: v for k, v in base_cfg.items() if k != "batch_size"}
+    colab_copy = {k: v for k, v in colab_cfg.items() if k != "batch_size"}
+    assert base_copy == colab_copy, "colab.yaml differs from base.yaml beyond batch_size"
+
+
+def _run_calls(source: str) -> list[ast.Call]:
+    """Return all calls to the notebook's run() helper."""
+    tree = ast.parse(source)
+    calls = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "run":
+            calls.append(node)
+    return calls
+
+
+def _is_training_run_call(node: ast.Call) -> bool:
+    """Return True if the run() call invokes spheroid_seg.train."""
+    first_arg = node.args[0] if node.args else None
+    if not isinstance(first_arg, ast.List):
+        return False
+    parts = [
+        elt.value
+        for elt in first_arg.elts
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+    ]
+    return "spheroid_seg.train" in parts
+
+
+def _env_dict_has_xla_fraction(node: ast.Call) -> bool:
+    """Return True if the run() call passes XLA_PYTHON_CLIENT_MEM_FRACTION=0.9."""
+    for kw in node.keywords:
+        if kw.arg == "env" and isinstance(kw.value, ast.Dict):
+            for key, value in zip(kw.value.keys, kw.value.values, strict=True):
+                if (
+                    isinstance(key, ast.Constant)
+                    and key.value == "XLA_PYTHON_CLIENT_MEM_FRACTION"
+                    and isinstance(value, ast.Constant)
+                    and value.value == "0.9"
+                ):
+                    return True
+    return False
+
+
+def test_notebook_sets_xla_mem_fraction_for_training() -> None:
+    """Every training subprocess sets XLA_PYTHON_CLIENT_MEM_FRACTION=0.9."""
+    for idx, source in _code_sources():
+        for node in _run_calls(source):
+            if _is_training_run_call(node):
+                assert _env_dict_has_xla_fraction(node), (
+                    f"Cell {idx}: training run() must pass "
+                    "env={{'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.9'}}"
+                )
