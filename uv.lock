@@ -2980,6 +2980,9 @@ cuda13 = [
 rocm = [
     { name = "jax", extra = ["rocm7-local"] },
 ]
+viz = [
+    { name = "matplotlib" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -2999,6 +3002,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda12'" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda13'" },
     { name = "jax", extras = ["rocm7-local"], marker = "extra == 'rocm'" },
+    { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
     { name = "optax" },
@@ -3007,7 +3011,7 @@ requires-dist = [
     { name = "scipy" },
     { name = "tifffile" },
 ]
-provides-extras = ["cuda12", "cuda13", "rocm"]
+provides-extras = ["cuda12", "cuda13", "rocm", "viz"]
 
 [package.metadata.requires-dev]
 dev = [

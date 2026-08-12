@@ -1,0 +1,79 @@
+# Colab GPU configuration.
+# Inherits every value from configs/base.yaml except batch_size, which is halved
+# so that a 512^2 training run fits on a free-tier Colab T4 (~15 GiB VRAM).
+
+# Model
+num_classes: 3
+patch_size: 512
+base_features: 32
+bn_momentum: 0.9
+
+# Optimization
+lr: 1.0e-3
+weight_decay: 1.0e-4
+batch_size: 4  # half of base.yaml to fit ~15 GiB Colab GPUs
+epochs: 100
+early_stopping_patience: 20
+
+# Class weights for cross-entropy (background down-weighted)
+class_weights: [0.1, 1.0, 1.0]
+
+seed: 42
+
+# Data layout (all paths are relative to the repository root)
+data:
+  raw_dir: data/raw
+  masks_dir: data/masks
+  splits_dir: data/splits
+  slimia_dir: data/slimia
+
+# Data pipeline
+input_channels: grayscale  # "rgb" | "grayscale"
+class_mapping:
+  0: 0
+  1: 1
+  2: 2
+  3: 2
+
+# Patching
+min_object_fraction: 0.05
+object_patch_ratio: 0.8
+patches_per_image: 16
+
+# Augmentation (probabilities and Albumentations parameters)
+augment:
+  flip_probability: 0.5
+  rotate90_probability: 0.5
+  elastic_probability: 0.3
+  scale_probability: 0.5
+  blur_probability: 0.2
+  noise_probability: 0.2
+  brightness_contrast_probability: 0.5
+  scale_range: [0.5, 2.0]
+  elastic_alpha: 1
+  elastic_sigma: 50
+  blur_limit: [3, 7]
+  blur_sigma_limit: [0.1, 2.0]
+  noise_std_range: [0.01, 0.05]
+  brightness_limit: 0.3
+  contrast_limit: 0.3
+
+# Generated artifacts (never committed)
+outputs:
+  checkpoints_dir: outputs/checkpoints
+  logs_dir: outputs/logs
+  predictions_dir: outputs/predictions
+  metrics_dir: outputs/metrics
+  qc_dir: outputs/qc
+  debug_dir: outputs/debug
+
+# Evaluation
+eval:
+  batch_size: 4
+  num_overlay_samples: 8
+  overlay_panel_width: 384
+
+# Inference (full-image stitching)
+infer:
+  overlap: 0.15
+  batch_size: 4

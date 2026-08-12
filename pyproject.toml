@@ -34,6 +34,7 @@ dependencies = [
 cuda12 = ["jax[cuda12]"]
 cuda13 = ["jax[cuda13]"]
 rocm   = ["jax[rocm7-local]"]
+viz    = ["matplotlib>=3.8"]
 
 [project.urls]
 Repository = "https://github.com/edgardomarchi/spheroid-seg"

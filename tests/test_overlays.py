@@ -130,7 +130,7 @@ def test_visualize_batches_requires_matplotlib_for_plotting() -> None:
     sys.meta_path.insert(0, blocker)
     try:
         module = _load_visualize_batches()
-        with pytest.raises(ModuleNotFoundError, match="uv sync --all-groups"):
+        with pytest.raises(ModuleNotFoundError, match=r"spheroid-seg\[viz\]"):
             module._get_pyplot()
     finally:
         sys.meta_path.remove(blocker)

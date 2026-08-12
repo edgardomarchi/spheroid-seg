@@ -68,7 +68,9 @@ directory, so runs never overwrite each other. `outputs/` is gitignored.
 ## Cloud GPU (Colab)
 
 `configs/base.yaml` (512² patches, 7.7M parameters) is impractical on CPU. A
-free Colab T4 runtime is enough to run it.
+free Colab T4 runtime is enough to run it, but the default `batch_size: 8` can
+push against the T4's ~15 GiB VRAM during XLA compilation. The notebook
+therefore uses `configs/colab.yaml` for full training.
 
 Open the notebook directly:
 
@@ -76,21 +78,50 @@ Open the notebook directly:
 
 What the notebook does, in order:
 
-1. Checks `nvidia-smi` and clones the repo.
-2. Installs uv and runs `uv sync --extra cuda12 --group dev` inside the clone
-   (the Colab kernel stays stock).
-3. Verifies JAX reports a `CudaDevice`.
-4. Runs `uv run pytest -q` as a clean-room reproducibility check.
+1. Detects whether a GPU is available (`nvidia-smi`) and clones the repo.
+2. Installs the package with pip in editable mode, adding the `viz` extra and,
+   on GPU runtimes, the `cuda12` JAX extra:
+   `pip install -e ".[cuda12,viz]"` (GPU) or `pip install -e ".[viz]"` (CPU).
+   The install cell skips if the package is already importable.
+3. Runs a fast post-install sanity check: import `spheroid_seg`, print the
+   package version, and `jax.devices()`.
+4. Optionally loads a private `data/` directory from Google Drive (see below);
+   by default this step is skipped and the synthetic fallback is used.
 5. Runs the pending M3 acceptance check:
-   `uv run python -m spheroid_seg.train --config configs/base.yaml --overfit-one-batch`
-   — loss should fall to near-zero.
-6. Optionally runs a few epochs of full `configs/base.yaml` training on the
-   synthetic fallback to measure GPU throughput.
-7. Zips the latest run under `outputs/runs/base_*/` and downloads it, because
+   `python -m spheroid_seg.train --config configs/base.yaml --overfit-one-batch`
+   on GPU only — loss should fall to near-zero. The subprocess sets
+   `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` to leave headroom for XLA.
+6. Runs a few epochs of full training with `configs/colab.yaml` (same model as
+   `base.yaml` but `batch_size: 4`) on the synthetic fallback to measure GPU
+   throughput. This subprocess also sets `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`.
+7. Plots training curves from the run's CSV log.
+8. Zips the latest run under `outputs/runs/colab_*/` and downloads it, because
    Colab sessions can be cut at any time.
 
-For real-data training, uncomment the Drive-mount cell and copy your `data/`
-directory into the clone before training.
+### Optional Google Drive data loading
+
+For real-data training, set `USE_DRIVE_DATA = True` in the setup cell. The
+notebook will then mount Drive and copy `raw/`, `masks/`, and `splits/` from
+`DRIVE_DATA_DIR` (default: `/content/drive/MyDrive/Colab Notebooks/spheroid-seg/data`)
+into the repo's `data/` directory using `shutil.copytree(..., dirs_exist_ok=True)`.
+Paths containing spaces are handled without shelling out.
+
+Leave `USE_DRIVE_DATA = False` (default) to keep the built-in synthetic fallback
+and ensure no private data is uploaded or committed. `data/` is `.gitignore`d
+(except `data/splits/*.txt`), so copied images are never committed to git.
+
+After copying, the cell prints the number of files in `data/raw` and
+`data/masks` and warns if either is zero, so a missing Drive path no longer
+silently falls back to synthetic data.
+
+### GPU memory note
+
+All training subprocesses launched by the notebook set
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`. This caps JAX/XLA at 90 % of GPU memory
+and prevents the allocator from repeatedly trying to grab the whole 16 GiB
+budget on a T4. `configs/colab.yaml` further halves activation memory with
+`batch_size: 4` while keeping the same 512² patches and base_features=32 as
+`configs/base.yaml`.
 
 ## Determinism
 
