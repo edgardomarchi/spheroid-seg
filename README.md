@@ -170,11 +170,15 @@ When annotated real images arrive:
 
 1. Run QC:
    `python -m spheroid_seg.data.qc --raw-dir data/raw --mask-dir data/masks`
-2. Fill `data/metadata.csv` with at least `image,magnification` (optionally add
-   `condition` for joint stratification).
-3. Create stratified splits:
+2. Generate `data/metadata.csv` from the raw filenames:
+   `python scripts/make_metadata.py --config configs/base.yaml`
+   This writes a CSV with header `image,magnification,condition`, parsing `_4x`
+   / `_10x` from each filename and leaving `condition` empty for manual fill.
+3. Optionally fill the `condition` column by hand if you want joint
+   stratification by magnification and condition.
+4. Create stratified splits:
    `python scripts/make_splits.py --config configs/base.yaml`
-4. Train and evaluate as usual:
+5. Train and evaluate as usual:
    `python -m spheroid_seg.train --config configs/base.yaml`
    `python -m spheroid_seg.eval --config configs/base.yaml`
 
