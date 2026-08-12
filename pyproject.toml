@@ -28,6 +28,7 @@ dependencies = [
     "tifffile",
     "numpy",
     "pyyaml",
+    "imagecodecs>=2026.6.26",
 ]
 
 [project.optional-dependencies]

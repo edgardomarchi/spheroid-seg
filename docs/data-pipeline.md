@@ -23,6 +23,14 @@ When annotated real images arrive:
 5. **Train/eval as usual**: `uv run python -m spheroid_seg.train --config configs/base.yaml`
    and `uv run python -m spheroid_seg.eval --config configs/base.yaml`.
 
+## TIFF and LZW support
+
+The pipeline reads both PNG and TIFF (`.tif`/`.tiff`) raw images and masks.
+TIFF files, including LZW-compressed TIFFs, are decoded through
+`tifffile` + `imagecodecs`, so no manual decompression is needed. The raw and
+mask formats are independent per pair: a PNG raw can be paired with a TIFF mask
+and vice versa, as long as both files share the same base name.
+
 ## Overview
 
 ```

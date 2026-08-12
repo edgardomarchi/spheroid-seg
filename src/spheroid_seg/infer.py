@@ -16,7 +16,13 @@ import numpy as np
 import yaml
 
 from spheroid_seg.checkpoints import resolve_checkpoint
-from spheroid_seg.data.dataset import IMAGE_EXTENSIONS, _to_grayscale, _to_rgb, normalize_percentile
+from spheroid_seg.data.dataset import (
+    IMAGE_EXTENSIONS,
+    _read_image,
+    _to_grayscale,
+    _to_rgb,
+    normalize_percentile,
+)
 from spheroid_seg.data.stitching import compute_stride, extract_overlapping_tiles, stitch_logits
 from spheroid_seg.models.unet import UNet
 from spheroid_seg.overlays import CLASS_COLORMAP
@@ -133,12 +139,7 @@ def _preprocess_image(image_path: Path, input_channels: str) -> np.ndarray:
     Returns:
         Normalized float32 image, 2D for grayscale or HxWx3 for RGB.
     """
-    image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-    if image is None:
-        raise FileNotFoundError(f"Unable to read image: {image_path}")
-
-    if image.ndim == 3 and image.shape[2] == 3:
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = _read_image(image_path)
 
     image = normalize_percentile(image)
 

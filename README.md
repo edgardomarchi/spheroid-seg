@@ -147,21 +147,27 @@ The repository does **not** contain images. The expected layout is:
 
 ```
 data/
-  raw/      # original microscopy images (JPG/TIFF)
-  masks/    # grayscale PNG annotations, same base name and size as the raw image
+  raw/      # original microscopy images (PNG / JPG / TIFF, including LZW-compressed TIFF)
+  masks/    # grayscale annotations (PNG or TIFF), same base name and size as the raw image
   splits/   # train.txt / val.txt / test.txt (image-level, never patch-level)
 ```
 
+Supported formats:
+
+- Raw images: `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff` (extension case is ignored).
+- Masks: `.png` or `.tif`/`.tiff`; both are loaded through `tifffile` so
+  LZW compression is supported end-to-end.
+
 Annotation format:
 
-- Grayscale PNG, uint8, same dimensions as the raw image.
+- Grayscale, uint8, same dimensions as the raw image.
 - Pixel values are class IDs:
   - `0` = background
   - `1` = loose cell
   - `2` = spheroid
   - `3` = organoid
 - The model trains with 3 classes: IDs `2` and `3` are merged in memory as
-  "aggregate" (the original PNGs are left untouched).
+  "aggregate" (the original files are left untouched).
 - Raw images and masks must share the same base name, ending in `_4x` or `_10x`
   (magnification is parsed from the filename for stratification and
   per-magnification metrics; `data/metadata.csv` can override it).
