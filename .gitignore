@@ -3,6 +3,7 @@ data/**
 !data/**/.gitkeep
 !data/splits/
 !data/splits/*.txt
+!data/metadata.csv
 
 # Generated artifacts
 outputs/
