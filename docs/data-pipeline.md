@@ -8,14 +8,19 @@ When annotated real images arrive:
 
 1. **Run QC**: `uv run python -m spheroid_seg.data.qc --raw-dir data/raw --mask-dir data/masks`.
    Fix any spec violations (wrong dimensions, values outside {0,1,2,3}, etc.).
-2. **Fill `data/metadata.csv`** with at least the columns `image,magnification`.
-   Add an optional `condition` column (e.g. cell line) if you want joint
-   stratification; the script falls back to magnification-only if any
-   `(magnification, condition)` group is too small.
-3. **Create the splits**: `uv run python scripts/make_splits.py --config configs/base.yaml`.
+2. **Generate `data/metadata.csv`**: `uv run python scripts/make_metadata.py --config configs/base.yaml`.
+   The script scans `data/raw/`, parses the trailing `_4x` or `_10x` suffix
+   (case-insensitive on the extension), and writes the CSV with header
+   `image,magnification,condition`. The `condition` column is left empty for
+   manual completion. Use `--update` to append newly added images while
+   preserving existing rows and their conditions; use `--force` to regenerate
+   from scratch.
+3. **Fill `condition` by hand** if you want joint stratification by
+   magnification and condition. Skip this step for magnification-only splits.
+4. **Create the splits**: `uv run python scripts/make_splits.py --config configs/base.yaml`.
    This writes deterministic, stratified `data/splits/{train,val,test}.txt` files.
    Use `--force` only when you intentionally want to overwrite existing splits.
-4. **Train/eval as usual**: `uv run python -m spheroid_seg.train --config configs/base.yaml`
+5. **Train/eval as usual**: `uv run python -m spheroid_seg.train --config configs/base.yaml`
    and `uv run python -m spheroid_seg.eval --config configs/base.yaml`.
 
 ## Overview
@@ -59,6 +64,12 @@ data/masks/  (annotation PNGs, IDs 0-3, same base name)
   `uv run python -m spheroid_seg.data.qc --raw-dir data/raw --mask-dir data/masks`.
   Run this FIRST whenever new annotations arrive. Exits non-zero on spec
   violations; writes a CSV report to `outputs/qc/`.
+- **make_metadata.py** — Generates `data/metadata.csv` from `data/raw/`
+  filenames. Recognizes `_4x` and `_10x` suffixes at the end of the stem
+  (extension case is ignored) and leaves `condition` empty for manual fill.
+  Files without a recognized suffix are kept with an empty `magnification`;
+  the script prints a warning listing them. Use `--update` to merge new images
+  without overwriting manual edits, or `--force` to regenerate from scratch.
 - **splits.py** — Reads `data/splits/{train,val,test}.txt`. Never re-shuffles;
   raises if the same image appears in two splits (patch-level leakage guard).
 - **dataset.py** — Paired loading, intensity normalization, `input_channels`
