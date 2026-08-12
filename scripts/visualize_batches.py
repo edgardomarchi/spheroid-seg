@@ -27,8 +27,9 @@ def _get_pyplot() -> Any:
         import matplotlib.pyplot as plt
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "matplotlib is required for visualization. "
-            "Install the notebook dependency group: uv sync --all-groups"
+            "This script requires matplotlib. "
+            'Install it with: pip install "spheroid-seg[viz]" (or: pip install matplotlib). '
+            "For uv development environments, use: uv sync --all-groups"
         ) from exc
     return plt
 

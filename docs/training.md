@@ -78,20 +78,23 @@ Open the notebook directly:
 
 What the notebook does, in order:
 
-1. Checks `nvidia-smi` and clones the repo.
-2. Installs uv and runs `uv sync --extra cuda12 --group dev --group notebooks`
-   inside the clone (the Colab kernel stays stock).
-3. Verifies JAX reports a `CudaDevice`.
+1. Detects whether a GPU is available (`nvidia-smi`) and clones the repo.
+2. Installs the package with pip in editable mode, adding the `viz` extra and,
+   on GPU runtimes, the `cuda12` JAX extra:
+   `pip install -e ".[cuda12,viz]"` (GPU) or `pip install -e ".[viz]"` (CPU).
+   The install cell skips if the package is already importable.
+3. Runs a fast post-install sanity check: import `spheroid_seg`, print the
+   package version, and `jax.devices()`.
 4. Optionally loads a private `data/` directory from Google Drive (see below);
    by default this step is skipped and the synthetic fallback is used.
-5. Runs `uv run pytest -q` as a clean-room reproducibility check.
-6. Runs the pending M3 acceptance check:
-   `uv run python -m spheroid_seg.train --config configs/base.yaml --overfit-one-batch`
-   — loss should fall to near-zero. The subprocess sets
+5. Runs the pending M3 acceptance check:
+   `python -m spheroid_seg.train --config configs/base.yaml --overfit-one-batch`
+   on GPU only — loss should fall to near-zero. The subprocess sets
    `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` to leave headroom for XLA.
-7. Runs a few epochs of full training with `configs/colab.yaml` (same model as
+6. Runs a few epochs of full training with `configs/colab.yaml` (same model as
    `base.yaml` but `batch_size: 4`) on the synthetic fallback to measure GPU
    throughput. This subprocess also sets `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`.
+7. Plots training curves from the run's CSV log.
 8. Zips the latest run under `outputs/runs/colab_*/` and downloads it, because
    Colab sessions can be cut at any time.
 

@@ -71,31 +71,68 @@ def test_notebook_references_repository_url() -> None:
     assert repo_url in nb_text, f"Notebook does not reference {repo_url}"
 
 
-def test_notebook_has_gpu_check_and_uv_commands() -> None:
+def test_notebook_has_gpu_check_and_pip_commands() -> None:
     """The notebook contains the expected Colab workflow markers."""
-    nb = _notebook()
-    sources = "".join(
-        "".join(cell["source"]) for cell in nb["cells"] if cell["cell_type"] == "code"
-    )
+    sources = "".join(source for _idx, source in _code_sources())
     assert "nvidia-smi" in sources
-    assert "uv" in sources
-    assert "sync" in sources
+    assert "pip" in sources
+    assert "install" in sources
     assert "jax.devices()" in sources
     assert "overfit-one-batch" in sources
 
 
-def test_notebook_has_gpu_detection_logic() -> None:
-    """The notebook detects GPU presence and selects the JAX extra accordingly."""
-    sources = "".join(source for _idx, source in _code_sources())
-    assert "HAS_GPU" in sources
-    assert "cuda12" in sources
-
-
-def test_notebook_uses_path_based_uv() -> None:
-    """No code cell hardcodes a home-relative uv binary path."""
+def test_notebook_has_no_uv_bootstrap_or_run_commands() -> None:
+    """No code cell bootstraps uv or invokes uv run/uv sync."""
+    for idx, source in _code_sources():
+        assert "uv run" not in source, f"Cell {idx} still uses uv run"
+        assert "uv sync" not in source, f"Cell {idx} still uses uv sync"
     nb_text = NOTEBOOK_PATH.read_text()
     assert "~/.cargo/bin/uv" not in nb_text
     assert "~/.local/bin/uv" not in nb_text
+
+
+def test_notebook_has_gpu_detection_logic() -> None:
+    """The notebook detects GPU presence and selects the JAX/viz extras accordingly."""
+    sources = "".join(source for _idx, source in _code_sources())
+    assert "HAS_GPU" in sources
+    assert "cuda12" in sources
+    assert "[viz]" in sources
+
+
+def test_notebook_install_cell_uses_pip_with_viz_extra() -> None:
+    """The install cell uses pip install -e with the viz extra (and cuda12 on GPU)."""
+    sources = dict(_code_sources())
+    install_idx = next(
+        idx for idx, source in _code_sources() if "pip" in source and "install" in source
+    )
+    source = sources[install_idx]
+    assert "pip" in source
+    assert "install" in source
+    assert "-e" in source
+    assert "PIP_EXTRA" in source
+    # Idempotent: skip install if the package is already importable.
+    assert "import spheroid_seg" in source
+
+
+def test_notebook_has_no_pytest_cell() -> None:
+    """No code cell runs the pytest suite anymore."""
+    for idx, source in _code_sources():
+        assert "pytest" not in source, f"Cell {idx} still references pytest"
+
+
+def test_notebook_has_post_install_sanity_cell() -> None:
+    """A sanity cell imports the package and prints JAX devices."""
+    sources = "".join(source for _idx, source in _code_sources())
+    assert "import spheroid_seg" in sources
+    assert "jax.devices()" in sources
+    assert "__version__" in sources
+
+
+def test_notebook_uses_colab_config_for_gpu_training() -> None:
+    """GPU training still selects configs/colab.yaml."""
+    sources = "".join(source for _idx, source in _code_sources())
+    assert "configs/colab.yaml" in sources
+    assert 'TRAIN_CONFIG = "configs/colab.yaml" if HAS_GPU' in sources
 
 
 def _is_absolute_path_expression(node: ast.AST) -> bool:
@@ -348,6 +385,29 @@ def _is_training_run_call(node: ast.Call) -> bool:
         if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
     ]
     return "spheroid_seg.train" in parts
+
+
+def _run_call_has_cwd_repo(node: ast.Call) -> bool:
+    """Return True if the run() call passes cwd=REPO."""
+    for kw in node.keywords:
+        if (
+            isinstance(kw, ast.keyword)
+            and kw.arg == "cwd"
+            and isinstance(kw.value, ast.Name)
+            and kw.value.id == "REPO"
+        ):
+            return True
+    return False
+
+
+def test_notebook_training_commands_use_run_helper_with_cwd_repo() -> None:
+    """Every training subprocess goes through run() with cwd=REPO."""
+    for idx, source in _code_sources():
+        for node in _run_calls(source):
+            if _is_training_run_call(node):
+                assert _run_call_has_cwd_repo(node), (
+                    f"Cell {idx}: training run() must pass cwd=REPO"
+                )
 
 
 def _env_dict_has_xla_fraction(node: ast.Call) -> bool:

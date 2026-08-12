@@ -65,6 +65,15 @@ pip install -e ".[cuda12]"
 # pip install -e ".[cuda13]"
 ```
 
+Available extras:
+
+| Extra | Installs | Who needs it |
+|---|---|---|
+| `cuda12` | `jax[cuda12]` | NVIDIA GPUs with CUDA 12 |
+| `cuda13` | `jax[cuda13]` | NVIDIA GPUs with CUDA 13 |
+| `rocm` | `jax[rocm7-local]` | AMD GPUs with ROCm |
+| `viz` | `matplotlib>=3.8` | `scripts/visualize_batches.py` and training-curve plots |
+
 ### Development path — uv (recommended for contributors)
 
 [uv](https://docs.astral.sh/uv/) gives a locked, reproducible environment and is
@@ -120,6 +129,17 @@ python -m spheroid_seg.infer --config configs/tiny.yaml \
 For a real training run, switch to `configs/base.yaml` (512² patches, 7.7M
 parameters); it is intended for a GPU or Colab T4. See `docs/training.md` for
 longer runs and the `--overfit-one-batch` sanity check.
+
+### Colab quickstart
+
+Open the notebook in Colab to run a short training example without installing
+anything locally:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/edgardomarchi/spheroid-seg/blob/main/notebooks/colab_training.ipynb)
+
+The notebook installs the package with `pip install -e ".[cuda12,viz]"` on GPU
+runtimes and `pip install -e ".[viz]"` on CPU runtimes, then imports the
+package, checks `jax.devices()`, and runs a short training example.
 
 ## Data expectations and real-data onboarding
 
