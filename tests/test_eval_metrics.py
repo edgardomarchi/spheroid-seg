@@ -85,3 +85,27 @@ def test_group_by_magnification() -> None:
     assert grouped["4x"] == [1, 2]
     assert grouped["10x"] == [3]
     assert grouped["unknown"] == [4]
+
+
+def test_accumulate_confusion_matrix_avoids_float32_saturation() -> None:
+    """Regression: counts must stay exact past the float32 mantissa (2**24).
+
+    The old path built float32 one-hot vectors and used jnp.dot, whose
+    accumulator rounds to the nearest representable float32. Beyond 2**24
+    pixels of a single class, adding 1.0 rounds back to the same value, so
+    the count freezes at 16,777,216. This test accumulates >2**24 pixels of
+    class 0 and asserts the exact integer count.
+    """
+    n_tiles = 5
+    tile = 2048
+    total_pixels = n_tiles * tile * tile  # 20_971_520 > 2**24
+
+    target = jnp.zeros((n_tiles, tile, tile), dtype=jnp.int32)
+    pred = jnp.zeros_like(target)
+
+    conf = accumulate_confusion_matrix(pred, target, num_classes=3)
+    conf = np.asarray(conf)
+
+    assert conf.dtype == np.uint32
+    assert conf[0, 0] == total_pixels
+    assert conf.sum() == total_pixels

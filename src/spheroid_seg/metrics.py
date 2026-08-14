@@ -22,13 +22,13 @@ def _per_class_counts(
         Tuple of (intersection, prediction_area, target_area), each of shape
         (num_classes,).
     """
-    pred_one_hot = jax.nn.one_hot(predictions, num_classes=num_classes)
-    target_one_hot = jax.nn.one_hot(targets, num_classes=num_classes)
+    pred_one_hot = jax.nn.one_hot(predictions, num_classes=num_classes, dtype=jnp.uint32)
+    target_one_hot = jax.nn.one_hot(targets, num_classes=num_classes, dtype=jnp.uint32)
 
     axes = tuple(range(predictions.ndim))
-    intersection = jnp.sum(pred_one_hot * target_one_hot, axis=axes)
-    prediction_area = jnp.sum(pred_one_hot, axis=axes)
-    target_area = jnp.sum(target_one_hot, axis=axes)
+    intersection = jnp.sum(pred_one_hot * target_one_hot, axis=axes, dtype=jnp.uint32)
+    prediction_area = jnp.sum(pred_one_hot, axis=axes, dtype=jnp.uint32)
+    target_area = jnp.sum(target_one_hot, axis=axes, dtype=jnp.uint32)
 
     return intersection, prediction_area, target_area
 
