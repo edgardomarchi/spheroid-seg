@@ -5,8 +5,9 @@ microscopy images (4x and 10x). Framework: JAX/Flax. v0.1 scope: semantic
 segmentation only (background / loose cell / aggregate).
 
 **Read `docs/design.md` before any non-trivial task** — it is the full design
-spec (data formats, architecture, decisions, risks). This file only holds stable
-conventions and commands; do not duplicate design content here.
+spec (data formats, architecture, decisions, risks). **See `docs/status.md` for
+current project state, baseline numbers, and pending next steps.** This file only
+holds stable conventions and commands; do not duplicate design content here.
 
 ## Stack
 

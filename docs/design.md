@@ -156,6 +156,19 @@ Image → [Stage 1: semantic U-Net]   → 3-class mask          (v0.1)
 `num_classes` in config, in case spheroid/organoid annotations prove highly
 consistent and the hybrid approach disappoints.
 
+**Status notes (2026-08-14)**
+
+- **D2**: the first real-data baseline shows that loose↔aggregate cross-confusion
+  dominates the error while a GT audit found zero mixed-class objects and no
+  annotation noise. This supports the escape-hatch intuition that the
+  loose/aggregate distinction may be better handled by v0.2 object-level
+  classification than by the pixel-level network. Decision deferred until
+  ~50 annotated images: either stay 3-class or collapse to 2-class
+  (background / object). See `docs/status.md`.
+- **D4**: no per-magnification failure signal so far (per-image background Dice
+  10x ≈ 4x in the 3-image validation split), but the evidence is weak because val n
+  is 2 vs 1. The single-model strategy stays; revisit after the full batch.
+
 ---
 
 ## 5. Tech stack
@@ -258,6 +271,37 @@ spheroid-seg/
    predicted masks (same images). This is the validation the clinical group cares
    about.
 4. **Qualitative**: overlay grids on test before accepting any checkpoint.
+
+### Current baseline (2026-08-14)
+Baseline computed on the validation split — the same split that guided early stopping, so these numbers are mildly optimistic. The test split remains untouched and is reserved for the final v0.1 acceptance check (§8 criteria).
+First real-data training: `outputs/runs/colab_20260812_182023`,
+`configs/base.yaml` with `bn_momentum: 0.9`, early stopping at epoch 47,
+best checkpoint at ~epoch 27. Evaluated on the 3-image validation split
+(2× 10x, 1× 4x). **All numbers are post-fix** for the float32 confusion-matrix
+saturation bug (`outputs/evals/base_20260814_132521/`).
+
+Validation Dice (background / loose cell / aggregate):
+
+| Group | n | background | loose cell | aggregate |
+|---|---|---:|---:|---:|
+| overall | 3 | 0.9907 | 0.3554 | 0.2954 |
+| 10x | 2 | 0.9888 | 0.3505 | 0.2983 |
+| 4x | 1 | 0.9945 | 0.3664 | 0.2856 |
+
+Confusion matrix (rows = GT, columns = prediction; total = 150,160,512 px):
+
+| GT \ pred | background | loose cell | aggregate |
+|---|---:|---:|---:|
+| background | 145,127,942 | 351,148 | 2,236,410 |
+| loose cell | 70,879 | 434,604 | 426,133 |
+| aggregate | 61,393 | 728,261 | 723,742 |
+
+Interpretation: background is essentially solved; the model struggles to
+discriminate loose cells from aggregates at the pixel level, with roughly
+half of each foreground class mislabelled as the other. A GT audit found no
+mixed-class objects and no annotation noise, so this is a genuine semantic
+limitation. See `docs/status.md` for the full baseline, decision evidence,
+and next steps.
 
 ---
 
