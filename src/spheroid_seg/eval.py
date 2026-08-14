@@ -197,15 +197,20 @@ def accumulate_confusion_matrix(
     targets: jnp.ndarray,
     num_classes: int,
 ) -> jnp.ndarray:
-    """Compute a pixel-level confusion matrix (rows=GT, columns=prediction)."""
-    predictions = jnp.asarray(predictions)
-    targets = jnp.asarray(targets)
-    pred_one_hot = jax.nn.one_hot(predictions, num_classes=num_classes)
-    target_one_hot = jax.nn.one_hot(targets, num_classes=num_classes)
+    """Compute a pixel-level confusion matrix (rows=GT, columns=prediction).
 
-    pred_flat = pred_one_hot.reshape(-1, num_classes)
-    target_flat = target_one_hot.reshape(-1, num_classes)
-    return jnp.dot(target_flat.T, pred_flat).astype(jnp.int32)
+    Counts are accumulated in uint32 so that pooled counts above the float32
+    mantissa limit (2**24) remain exact. The old one-hot + jnp.dot path used
+    float32 internally and saturated at 2**24. uint32 is provably safe here
+    because every count is non-negative and the total number of pixels in any
+    evaluation run is far below 2**32.
+    """
+    predictions = jnp.asarray(predictions, dtype=jnp.uint32).ravel()
+    targets = jnp.asarray(targets, dtype=jnp.uint32).ravel()
+    flat_idx = targets * num_classes + predictions
+    counts = jnp.zeros(num_classes * num_classes, dtype=jnp.uint32)
+    counts = counts.at[flat_idx].add(1)
+    return counts.reshape(num_classes, num_classes)
 
 
 def class_metrics_from_confusion(
