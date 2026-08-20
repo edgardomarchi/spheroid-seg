@@ -10,6 +10,8 @@ from spheroid_seg.eval import (
     accumulate_confusion_matrix,
     class_metrics_from_confusion,
     group_by_magnification,
+    object_confusion_from_3x3,
+    object_metrics_from_3x3,
 )
 from spheroid_seg.metrics import dice_score, iou_score
 
@@ -109,3 +111,95 @@ def test_accumulate_confusion_matrix_avoids_float32_saturation() -> None:
     assert conf.dtype == np.uint32
     assert conf[0, 0] == total_pixels
     assert conf.sum() == total_pixels
+
+
+def test_object_confusion_from_3x3_hand_computed() -> None:
+    """Object confusion collapses the 3x3 matrix exactly as defined."""
+    # 3x3 confusion: rows=GT, cols=pred (bg/loose/aggregate).
+    conf = jnp.array(
+        [
+            [60, 2, 1],
+            [3, 5, 1],
+            [2, 1, 4],
+        ],
+        dtype=jnp.uint32,
+    )
+    obj_conf = object_confusion_from_3x3(conf)
+    expected = jnp.array(
+        [
+            [60, 3],  # bg GT: 2+1 predicted as object
+            [5, 11],  # object GT: 3+2 predicted bg; 5+1+1+4 correct object
+        ],
+        dtype=jnp.uint32,
+    )
+    np.testing.assert_array_equal(np.asarray(obj_conf), np.asarray(expected))
+
+
+def test_object_metric_loose_aggregate_swap_counts_correct() -> None:
+    """A loose<->aggregate swap is a correct object prediction."""
+    target = np.zeros((8, 8), dtype=np.int32)
+    target[1:3, 1:3] = 1  # 4 loose-cell pixels
+    target[3:5, 3:5] = 2  # 4 aggregate pixels
+
+    pred = target.copy()
+    pred[2, 2] = 2  # one loose pixel predicted as aggregate
+    pred[4, 4] = 1  # one aggregate pixel predicted as loose
+
+    conf = accumulate_confusion_matrix(pred, target, num_classes=3)
+    obj = object_metrics_from_3x3(conf)
+
+    # All 8 object pixels are object in both pred and target; no bg/object errors.
+    assert obj["dice"] == pytest.approx(1.0, abs=1e-6)
+    assert obj["iou"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_object_dice_differs_from_background_dice() -> None:
+    """Object Dice stays low when foreground is missed, unlike background Dice."""
+    target = np.zeros((8, 8), dtype=np.int32)
+    target[0, 0] = 1  # single foreground pixel
+    pred = np.zeros_like(target)  # predicted all background
+
+    conf = accumulate_confusion_matrix(pred, target, num_classes=3)
+    pooled = class_metrics_from_confusion(conf)
+    obj = object_metrics_from_3x3(conf)
+
+    # Background Dice is high but not 1.0: the missed object pixel is a bg FN.
+    assert pooled["dice"][0] == pytest.approx(126 / 127, abs=1e-6)
+    # Object Dice is zero because the single object pixel is missed.
+    assert obj["dice"] == pytest.approx(0.0, abs=1e-6)
+    assert obj["iou"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_object_dice_perfect_when_identical() -> None:
+    """Identical prediction and target give object Dice == 1.0."""
+    target = jnp.array(
+        [
+            [0, 0, 0, 0],
+            [0, 1, 1, 0],
+            [0, 2, 2, 0],
+            [0, 0, 0, 0],
+        ],
+        dtype=jnp.int32,
+    )
+    pred = target.copy()
+
+    conf = accumulate_confusion_matrix(pred, target, num_classes=3)
+    obj = object_metrics_from_3x3(conf)
+
+    assert obj["dice"] == pytest.approx(1.0, abs=1e-6)
+    assert obj["iou"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_object_metrics_use_uint32_counts() -> None:
+    """Object metrics must not introduce new float32 count accumulation."""
+    target = jnp.zeros((2, 2048, 2048), dtype=jnp.int32)
+    target = target.at[:, 0, 0].set(1)
+    pred = jnp.zeros_like(target)
+
+    conf = accumulate_confusion_matrix(pred, target, num_classes=3)
+    obj_conf = object_confusion_from_3x3(conf)
+    obj_conf = np.asarray(obj_conf)
+
+    assert obj_conf.dtype == np.uint32
+    # object->background errors = 2 (the two misclassified object pixels).
+    assert obj_conf[1, 0] == 2

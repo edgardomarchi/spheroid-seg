@@ -114,6 +114,36 @@ directory uses a timestamp, so multiple runs never overwrite each other.
 - **Unknown magnification** never crashes evaluation; such images are reported
   as their own `"unknown"` group.
 
+## Combined "object" metric
+
+In addition to the three model classes, eval reports a secondary **object**
+metric that merges the two foreground classes:
+
+- `object = (class == 1) | (class == 2)` — any foreground pixel.
+- `background = (class == 0)` — the complement.
+
+The object Dice/IoU is computed from a virtual 2x2 confusion matrix derived
+from the standard 3x3 matrix:
+
+```
+                 predicted
+              bg        object
+GT bg    C[0,0]    C[0,1] + C[0,2]
+   object C[1,0] + C[2,0]    C[1,1] + C[1,2] + C[2,1] + C[2,2]
+```
+
+This metric is decision-relevant for the v0.2 design choice (D2 escape hatch,
+see `docs/design.md` §4): the first real-data baseline showed that loose cells
+and aggregates are frequently cross-confused at the pixel level while still
+being correctly separated from background. The object score measures "how well
+do we separate foreground from background?" independent of the harder
+loose/aggregate distinction. Only the object row is reported; the virtual
+background row is redundant with the existing background class.
+
+The object row appears in `metrics.csv`, `metrics.json`, the stdout summary
+table, and a separate `confusion_matrix_object.csv`. The 3x3 confusion matrix
+is unchanged.
+
 ## Known limitations
 
 - Tiling is currently non-overlapping; overlapping patches with logit averaging
