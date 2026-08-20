@@ -150,8 +150,8 @@ pixels of one class. All numbers above are post-fix (verified run:
 2. **Decide 2-class vs 3-class at ~50 annotated images** (D2 escape hatch).
    Current evidence supports deferring the loose/aggregate distinction to v0.2
    object-level classification, but the decision needs more data.
-3. **Add a combined "object" (class 1 ∪ class 2) Dice metric** to eval as a
-   secondary output. Recommended; maintainer has not confirmed yet.
+3. ~~Add a combined "object" (class 1 ∪ class 2) Dice metric to eval as a
+   secondary output.~~ Done — see `docs/evaluation.md` §Combined "object" metric.
 4. **Meet v0.1 release criteria** (design doc §8): aggregate Dice ≥ 0.85,
    loose-cell Dice ≥ 0.75 → tag v0.1 when met.
 5. **Zenodo sample publication + `scripts/download_data.py` fetch step**

@@ -237,6 +237,46 @@ def class_metrics_from_confusion(
     return {"dice": dice, "iou": iou}
 
 
+def object_confusion_from_3x3(confusion: jnp.ndarray) -> jnp.ndarray:
+    """Collapse a 3-class confusion matrix into a binary bg/object matrix.
+
+    Virtual classes are defined as ``background = (class == 0)`` and
+    ``object = (class == 1) | (class == 2)``. The returned 2x2 matrix has
+    rows/ground-truth and columns/prediction ordered ``[background, object]``.
+
+    The summation stays in uint32 so it reuses the exact-integer accumulation
+    path; no new float32 count accumulation is introduced.
+    """
+    bg_bg = confusion[0, 0]
+    bg_obj = confusion[0, 1] + confusion[0, 2]
+    obj_bg = confusion[1, 0] + confusion[2, 0]
+    obj_obj = confusion[1, 1] + confusion[1, 2] + confusion[2, 1] + confusion[2, 2]
+    return jnp.array(
+        [[bg_bg, bg_obj], [obj_bg, obj_obj]],
+        dtype=jnp.uint32,
+    )
+
+
+def object_metrics_from_3x3(
+    confusion: jnp.ndarray,
+    *,
+    epsilon: float = 1e-6,
+) -> dict[str, jnp.ndarray]:
+    """Compute the virtual object-class Dice and IoU from a 3-class confusion matrix.
+
+    Args:
+        confusion: 3x3 confusion matrix with class order
+            ``[background, loose cell, aggregate]``.
+        epsilon: Small constant for numerical stability.
+
+    Returns:
+        Dictionary with scalar ``dice`` and ``iou`` for the object virtual class.
+    """
+    obj_conf = object_confusion_from_3x3(confusion)
+    pooled = class_metrics_from_confusion(obj_conf, epsilon=epsilon)
+    return {"dice": pooled["dice"][1], "iou": pooled["iou"][1]}
+
+
 def group_by_magnification(
     names: list[str],
     values: list[Any],
@@ -262,17 +302,21 @@ def _compute_metrics(
     all_target = jnp.concatenate([jnp.asarray(m).ravel() for m in masks])
     global_confusion = accumulate_confusion_matrix(all_pred, all_target, num_classes)
     overall = class_metrics_from_confusion(global_confusion)
+    overall_object = object_metrics_from_3x3(global_confusion)
 
     per_image: list[dict[str, Any]] = []
     for (_, mask, name), pred in zip(samples, predictions, strict=False):
-        dice = np.asarray(dice_score(pred, mask, num_classes))
-        iou = np.asarray(iou_score(pred, mask, num_classes))
+        conf = accumulate_confusion_matrix(pred, mask, num_classes)
+        pooled = class_metrics_from_confusion(conf)
+        obj = object_metrics_from_3x3(conf)
         per_image.append(
             {
                 "name": name,
                 "magnification": parse_magnification(name),
-                "dice": dice.tolist(),
-                "iou": iou.tolist(),
+                "dice": np.asarray(pooled["dice"]).tolist(),
+                "iou": np.asarray(pooled["iou"]).tolist(),
+                "object_dice": float(obj["dice"]),
+                "object_iou": float(obj["iou"]),
             }
         )
 
@@ -285,6 +329,7 @@ def _compute_metrics(
         group_target = jnp.concatenate([jnp.asarray(m).ravel() for m in grouped_masks[mag]])
         conf = accumulate_confusion_matrix(group_pred, group_target, num_classes)
         pooled = class_metrics_from_confusion(conf)
+        obj = object_metrics_from_3x3(conf)
 
         group_dices = [
             np.asarray(dice_score(p, m, num_classes))
@@ -294,15 +339,28 @@ def _compute_metrics(
             np.asarray(iou_score(p, m, num_classes))
             for p, m in zip(grouped_preds[mag], grouped_masks[mag], strict=False)
         ]
+        group_object_dices = []
+        group_object_ious = []
+        for p, m in zip(grouped_preds[mag], grouped_masks[mag], strict=False):
+            im_conf = accumulate_confusion_matrix(p, m, num_classes)
+            im_obj = object_metrics_from_3x3(im_conf)
+            group_object_dices.append(float(im_obj["dice"]))
+            group_object_ious.append(float(im_obj["iou"]))
 
         per_magnification[mag] = {
             "dice": np.asarray(pooled["dice"]).tolist(),
             "iou": np.asarray(pooled["iou"]).tolist(),
+            "object_dice": float(obj["dice"]),
+            "object_iou": float(obj["iou"]),
             "per_image": {
                 "mean_dice": np.mean(group_dices, axis=0).tolist(),
                 "std_dice": np.std(group_dices, axis=0).tolist(),
                 "mean_iou": np.mean(group_ious, axis=0).tolist(),
                 "std_iou": np.std(group_ious, axis=0).tolist(),
+                "mean_object_dice": float(np.mean(group_object_dices)),
+                "std_object_dice": float(np.std(group_object_dices)),
+                "mean_object_iou": float(np.mean(group_object_ious)),
+                "std_object_iou": float(np.std(group_object_ious)),
             },
             "n_images": len(grouped_preds[mag]),
         }
@@ -311,10 +369,13 @@ def _compute_metrics(
         "overall": {
             "dice": np.asarray(overall["dice"]).tolist(),
             "iou": np.asarray(overall["iou"]).tolist(),
+            "object_dice": float(overall_object["dice"]),
+            "object_iou": float(overall_object["iou"]),
         },
         "per_magnification": per_magnification,
         "per_image": per_image,
         "confusion_matrix": np.asarray(global_confusion).tolist(),
+        "confusion_matrix_object": np.asarray(object_confusion_from_3x3(global_confusion)).tolist(),
         "class_names": CLASS_NAMES,
     }
 
@@ -326,7 +387,11 @@ def _write_outputs(
     predictions: list[np.ndarray],
     config: dict[str, Any],
 ) -> None:
-    """Write metrics.json, metrics.csv, confusion_matrix.csv, and overlay grid."""
+    """Write metrics.json, metrics.csv, confusion matrices, and overlay grid.
+
+    Writes the original 3x3 ``confusion_matrix.csv`` plus an optional
+    ``confusion_matrix_object.csv`` (2x2 virtual bg/object) derived from it.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
@@ -345,6 +410,15 @@ def _write_outputs(
                     len(samples),
                 ]
             )
+        writer.writerow(
+            [
+                "overall",
+                "object",
+                metrics["overall"]["object_dice"],
+                metrics["overall"]["object_iou"],
+                len(samples),
+            ]
+        )
         for mag, group in metrics["per_magnification"].items():
             for idx, class_name in enumerate(CLASS_NAMES[:num_classes]):
                 writer.writerow(
@@ -356,12 +430,28 @@ def _write_outputs(
                         group["n_images"],
                     ]
                 )
+            writer.writerow(
+                [
+                    mag,
+                    "object",
+                    group["object_dice"],
+                    group["object_iou"],
+                    group["n_images"],
+                ]
+            )
 
     with (output_dir / "confusion_matrix.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([""] + CLASS_NAMES[:num_classes])
         for idx, class_name in enumerate(CLASS_NAMES[:num_classes]):
             writer.writerow([class_name] + metrics["confusion_matrix"][idx])
+
+    with (output_dir / "confusion_matrix_object.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        obj_names = ["background", "object"]
+        writer.writerow([""] + obj_names)
+        for idx, class_name in enumerate(obj_names):
+            writer.writerow([class_name] + metrics["confusion_matrix_object"][idx])
 
     eval_config = config.get("eval", {})
     num_overlay_samples = eval_config.get("num_overlay_samples", 8)
@@ -416,11 +506,16 @@ def _print_summary(metrics: dict[str, Any]) -> None:
             f"{'overall':<12} {class_name:<14} "
             f"{metrics['overall']['dice'][idx]:>8.4f} {metrics['overall']['iou'][idx]:>8.4f}"
         )
+    print(
+        f"{'overall':<12} {'object':<14} "
+        f"{metrics['overall']['object_dice']:>8.4f} {metrics['overall']['object_iou']:>8.4f}"
+    )
     for mag, group in sorted(metrics["per_magnification"].items()):
         for idx, class_name in enumerate(metrics["class_names"]):
             print(
                 f"{mag:<12} {class_name:<14} {group['dice'][idx]:>8.4f} {group['iou'][idx]:>8.4f}"
             )
+        print(f"{mag:<12} {'object':<14} {group['object_dice']:>8.4f} {group['object_iou']:>8.4f}")
     print("-" * 60)
 
 
@@ -431,6 +526,10 @@ def evaluate_split(
     checkpoint_path: Path,
 ) -> tuple[Path, dict[str, Any]]:
     """Run evaluation for a split and write all outputs.
+
+    Outputs are written to a unique ``outputs/evals/<config>_<timestamp>/``
+    directory: ``metrics.json``, ``metrics.csv``, ``confusion_matrix.csv``,
+    ``confusion_matrix_object.csv``, and ``overlays_grid.png``.
 
     Returns:
         Tuple of (output directory, metrics dictionary).

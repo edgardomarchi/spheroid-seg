@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -100,6 +101,7 @@ def test_eval_cli_creates_all_outputs(trained_smoke_run: tuple[Path, Path]) -> N
     assert (eval_dir / "metrics.json").exists()
     assert (eval_dir / "metrics.csv").exists()
     assert (eval_dir / "confusion_matrix.csv").exists()
+    assert (eval_dir / "confusion_matrix_object.csv").exists()
     assert (eval_dir / "overlays_grid.png").exists()
 
 
@@ -287,3 +289,52 @@ def test_real_data_without_splits_raises_clear_error(tmp_path: Path) -> None:
     assert result.returncode != 0
     combined_output = result.stdout + result.stderr
     assert "split files" in combined_output.lower()
+
+
+def test_eval_cli_object_row_everywhere(trained_smoke_run: tuple[Path, Path]) -> None:
+    """The object row appears in metrics.csv, stdout, and metrics.json."""
+    config_path, _ = trained_smoke_run
+    result = _run_eval(config_path, split="val")
+    assert result.returncode == 0, result.stderr
+
+    config = yaml.safe_load(config_path.read_text())
+    evals_dir = Path(config["outputs"]["checkpoints_dir"]).parent / "evals"
+    eval_dirs = sorted(evals_dir.glob(f"{config_path.stem}_*"), key=lambda p: p.stat().st_mtime)
+    assert eval_dirs, "No eval output directory created"
+    eval_dir = eval_dirs[-1]
+
+    # CSV: one object row per group.
+    rows = list(csv.reader((eval_dir / "metrics.csv").open("r", newline="")))
+    assert rows[0] == ["group", "class", "dice", "iou", "n_images"]
+    object_rows = [row for row in rows[1:] if row[1] == "object"]
+    groups = {row[0] for row in object_rows}
+    assert {"overall", "4x", "10x"}.issubset(groups)
+    for row in object_rows:
+        assert 0.0 <= float(row[2]) <= 1.0
+        assert 0.0 <= float(row[3]) <= 1.0
+
+    # Stdout summary table contains object rows.
+    stdout = result.stdout
+    assert "object" in stdout.lower()
+    object_lines = [line for line in stdout.splitlines() if "object" in line.lower()]
+    assert len(object_lines) >= 3  # overall + 4x + 10x
+
+    # JSON: object metrics in overall, per-magnification, and per-image.
+    metrics = json.loads((eval_dir / "metrics.json").read_text())
+    assert "object_dice" in metrics["overall"]
+    assert "object_iou" in metrics["overall"]
+    assert 0.0 <= metrics["overall"]["object_dice"] <= 1.0
+    assert 0.0 <= metrics["overall"]["object_iou"] <= 1.0
+
+    for mag, group in metrics["per_magnification"].items():
+        assert "object_dice" in group, f"missing object_dice in {mag}"
+        assert "object_iou" in group, f"missing object_iou in {mag}"
+        assert "mean_object_dice" in group["per_image"]
+        assert "std_object_dice" in group["per_image"]
+        assert "mean_object_iou" in group["per_image"]
+        assert "std_object_iou" in group["per_image"]
+
+    assert metrics["per_image"]
+    for entry in metrics["per_image"]:
+        assert "object_dice" in entry
+        assert "object_iou" in entry
