@@ -437,7 +437,8 @@ def _truncate_log_to_epoch(log_path: Path, target_epoch: int) -> None:
     """
     if not log_path.exists():
         return
-    text = log_path.read_text(newline="")
+    with log_path.open("r", newline="") as f:
+        text = f.read()
     lines = text.splitlines(keepends=True)
     if not lines:
         return
@@ -461,14 +462,16 @@ def _truncate_log_to_epoch(log_path: Path, target_epoch: int) -> None:
 
     if last_good_index < 0:
         # No complete data rows remain; keep only the header.
-        log_path.write_text(header, newline="")
+        with log_path.open("w", newline="") as f:
+            f.write(header)
         return
 
     kept = [header, *data_lines[: last_good_index + 1]]
     # Ensure the file ends with a newline so subsequent appends start cleanly.
     if kept and not kept[-1].endswith("\n") and not kept[-1].endswith("\r\n"):
         kept[-1] += "\n"
-    log_path.write_text("".join(kept), newline="")
+    with log_path.open("w", newline="") as f:
+        f.write("".join(kept))
 
 
 def _dataset_from_pairs(
