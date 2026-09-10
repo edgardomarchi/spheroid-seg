@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import datetime
 import tempfile
@@ -34,10 +35,72 @@ class TrainState(train_state.TrainState):
     batch_stats: Any
 
 
+# Resume checkpoint layout.  We use two files because flax.serialization can only
+# round-trip JAX/NumPy arrays; strings and nested dicts must live elsewhere.
+TRAINING_STATE_NAME = "training_state.msgpack"
+TRAINING_STATE_METADATA_NAME = "training_state_metadata.yaml"
+TRAINING_PATCHES_NAME = "training_patches.npz"
+
+# Keys that may differ between the checkpoint's config and the resumed run's
+# config without aborting.  All other keys must match for bit-identical resume.
+OVERRIDABLE_KEYS = {"epochs", "early_stopping_patience"}
+
+
 def load_config(path: Path) -> dict[str, Any]:
     """Load the YAML configuration file."""
     with path.open("r") as f:
         return yaml.safe_load(f)
+
+
+def _flatten_config(config: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Flatten a nested config dict into dotted keys for easy comparison."""
+    flat: dict[str, Any] = {}
+    for key, value in config.items():
+        dotted = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
+        if isinstance(value, dict):
+            flat.update(_flatten_config(value, dotted))
+        else:
+            flat[dotted] = value
+    return flat
+
+
+def _validate_resume_config(
+    current_config: dict[str, Any],
+    snapshot_config: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Compare current config to the snapshot stored in a resume checkpoint.
+
+    Args:
+        current_config: Config used to launch the resumed run.
+        snapshot_config: Config snapshot from the checkpoint.
+
+    Returns:
+        Tuple of (errors, overrides) where ``errors`` are immutable keys that
+        differ and ``overrides`` are allowed keys that differ.
+
+    Raises:
+        Nothing; callers decide how to report the returned lists.
+    """
+    current = _flatten_config(current_config)
+    snapshot = _flatten_config(snapshot_config)
+
+    errors: list[str] = []
+    overrides: list[str] = []
+    all_keys = set(current.keys()) | set(snapshot.keys())
+
+    for key in sorted(all_keys):
+        if key.startswith("outputs."):
+            # Output paths do not affect the training computation.
+            continue
+        if current.get(key) == snapshot.get(key):
+            continue
+        base_key = key.split(".", 1)[0]
+        if base_key in OVERRIDABLE_KEYS:
+            overrides.append(key)
+        else:
+            errors.append(key)
+
+    return errors, overrides
 
 
 def _ensure_data_dirs(config: dict[str, Any], tmp_dir: Path) -> tuple[Path, Path, bool]:
@@ -249,7 +312,11 @@ def save_checkpoint(
     epoch: int,
     path: Path,
 ) -> None:
-    """Serialize parameters and batch stats to disk."""
+    """Serialize parameters and batch stats to disk.
+
+    This shallow checkpoint preserves the legacy format used by eval.py and
+    infer.py and only contains model weights and BatchNorm statistics.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {
         "params": state.params,
@@ -258,6 +325,150 @@ def save_checkpoint(
     }
     with path.open("wb") as f:
         f.write(flax.serialization.to_bytes(ckpt))
+
+
+def save_training_state(
+    state: TrainState,
+    *,
+    epoch: int,
+    best_dice: float,
+    patience_counter: int,
+    np_rng: np.random.Generator,
+    jax_rng: jax.Array,
+    config: dict[str, Any],
+    train_images: np.ndarray,
+    train_masks: np.ndarray,
+    val_images: np.ndarray,
+    val_masks: np.ndarray,
+    checkpoints_dir: Path,
+) -> None:
+    """Serialize the full training state needed for bit-identical resume."""
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+    state_path = checkpoints_dir / TRAINING_STATE_NAME
+    with state_path.open("wb") as f:
+        f.write(flax.serialization.to_bytes(state))
+
+    metadata = {
+        "epoch": epoch,
+        "best_dice": float(best_dice),
+        "patience_counter": int(patience_counter),
+        "np_rng_state": np_rng.bit_generator.state,
+        "jax_rng_key": [int(x) for x in np.asarray(jax_rng)],
+        "config": copy.deepcopy(config),
+    }
+    meta_path = checkpoints_dir / TRAINING_STATE_METADATA_NAME
+    with meta_path.open("w") as f:
+        yaml.safe_dump(metadata, f)
+
+    patches_path = checkpoints_dir / TRAINING_PATCHES_NAME
+    np.savez(
+        patches_path,
+        train_images=train_images,
+        train_masks=train_masks,
+        val_images=val_images,
+        val_masks=val_masks,
+    )
+
+
+def load_checkpoint(
+    checkpoint_path: Path,
+    config: dict[str, Any],
+) -> tuple[TrainState, dict[str, Any], dict[str, np.ndarray]]:
+    """Load the full training state produced by ``save_training_state``.
+
+    Args:
+        checkpoint_path: Path to ``training_state.msgpack``.
+        config: Config used to build the target TrainState (may differ from the
+            snapshot config for overridable keys only).
+
+    Returns:
+        Tuple of (restored TrainState, metadata dict, patches dict).
+
+    Raises:
+        FileNotFoundError: If either the msgpack or the metadata file is missing.
+        ValueError: If the checkpoint is an old-format shallow checkpoint, or if
+            the current config is incompatible with the checkpoint snapshot.
+    """
+    checkpoints_dir = checkpoint_path.parent
+    meta_path = checkpoints_dir / TRAINING_STATE_METADATA_NAME
+    patches_path = checkpoints_dir / TRAINING_PATCHES_NAME
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if not meta_path.exists():
+        raise ValueError(
+            f"Old-format checkpoint at {checkpoint_path}: "
+            f"missing {TRAINING_STATE_METADATA_NAME}. "
+            "Resume requires a checkpoint written by a version that saves the full training state."
+        )
+    if not patches_path.exists():
+        raise ValueError(
+            f"Incomplete checkpoint at {checkpoint_path}: missing {TRAINING_PATCHES_NAME}."
+        )
+
+    metadata = yaml.safe_load(meta_path.read_text())
+    errors, _overrides = _validate_resume_config(config, metadata["config"])
+    if errors:
+        raise ValueError(
+            "Config mismatch with checkpoint; the following immutable keys differ: "
+            + ", ".join(errors)
+        )
+
+    patches = dict(np.load(patches_path))
+
+    # Build a fresh target state with the (possibly overridden) config so that
+    # schedule changes such as extending max_epochs are honored.
+    steps_per_epoch = max(len(patches["train_images"]) // config["batch_size"], 1)
+    jax_rng = jax.random.PRNGKey(metadata["jax_rng_key"][0])
+    target_state = create_train_state(config, jax_rng, steps_per_epoch)
+
+    with checkpoint_path.open("rb") as f:
+        state = flax.serialization.from_bytes(target_state, f.read())
+
+    return state, metadata, patches
+
+
+def _truncate_log_to_epoch(log_path: Path, target_epoch: int) -> None:
+    """Truncate a CSV log after the last complete row <= ``target_epoch``.
+
+    This makes resumption robust against crashes that wrote a partial last line.
+    Line endings are preserved so that subsequent CSV appends remain consistent.
+    """
+    if not log_path.exists():
+        return
+    text = log_path.read_text(newline="")
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return
+
+    # First line is the header; keep it always.
+    header = lines[0]
+    data_lines = lines[1:]
+    last_good_index = -1
+    last_good_epoch = -1
+    for idx, line in enumerate(data_lines):
+        parts = line.rstrip("\r\n").split(",")
+        if not parts:
+            continue
+        try:
+            epoch = int(parts[0])
+        except ValueError:
+            continue
+        if epoch <= target_epoch and epoch > last_good_epoch:
+            last_good_index = idx
+            last_good_epoch = epoch
+
+    if last_good_index < 0:
+        # No complete data rows remain; keep only the header.
+        log_path.write_text(header, newline="")
+        return
+
+    kept = [header, *data_lines[: last_good_index + 1]]
+    # Ensure the file ends with a newline so subsequent appends start cleanly.
+    if kept and not kept[-1].endswith("\n") and not kept[-1].endswith("\r\n"):
+        kept[-1] += "\n"
+    log_path.write_text("".join(kept), newline="")
 
 
 def _dataset_from_pairs(
@@ -283,187 +494,271 @@ def train(
     run_dir: Path,
     overfit_one_batch: bool = False,
     epochs_override: int | None = None,
+    resume_from: Path | None = None,
 ) -> None:
-    """Run the training loop."""
+    """Run the training loop.
+
+    Args:
+        config: Training configuration dictionary.
+        run_dir: Directory for logs and checkpoints.
+        overfit_one_batch: If True, memorize one batch instead of full training.
+        epochs_override: Optional epoch count override.
+        resume_from: Path to ``training_state.msgpack`` for resumption.
+    """
     checkpoints_dir = run_dir / "checkpoints"
     logs_dir = run_dir / "logs"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    seed = config["seed"]
-    np_rng = np.random.default_rng(seed)
-    jax_rng = jax.random.PRNGKey(seed)
+    if resume_from is not None and overfit_one_batch:
+        raise ValueError("--resume is not supported with --overfit-one-batch.")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        raw_dir, masks_dir, has_real = _ensure_data_dirs(config, Path(tmp))
+    if resume_from is not None:
+        # Resume branch: load full training state and skip data rebuilding.
+        checkpoint_path = Path(resume_from)
+        state, metadata, patches = load_checkpoint(checkpoint_path, dict(config))
 
-        splits_dir = Path(config["data"]["splits_dir"])
-        train_dataset = SpheroidDataset(
-            raw_dir,
-            masks_dir,
-            input_channels=config["input_channels"],
-            class_mapping=config["class_mapping"],
-        )
-
-        if has_real:
-            # Real-data mode: split files are required and authoritative.
-            if not splits_dir.exists() or not any(splits_dir.glob("*.txt")):
-                raise ValueError(
-                    f"Real raw/mask pairs found in '{raw_dir}' / '{masks_dir}' "
-                    f"but no split files in '{splits_dir}'. "
-                    "Create splits with scripts/make_splits.py."
-                )
-
-            from spheroid_seg.data.splits import load_splits
-
-            splits = load_splits(splits_dir)
-            train_names = set(splits["train"])
-            val_names = set(splits["val"])
-            train_pairs = [p for p in train_dataset.pairs if p[2] in train_names]
-            val_pairs = [p for p in train_dataset.pairs if p[2] in val_names]
-            train_dataset.pairs = train_pairs
-            val_dataset = _dataset_from_pairs(
-                val_pairs, raw_dir, masks_dir, config["input_channels"], config["class_mapping"]
+        _errors, overrides = _validate_resume_config(config, metadata["config"])
+        if overrides:
+            print(
+                "Resuming with deliberate config overrides: "
+                + ", ".join(f"{k}={config[k]} (was {metadata['config'].get(k)})" for k in overrides)
             )
-        else:
-            # Synthetic fallback: ignore committed split files when no real pairs
-            # are present, but warn so the behavior is explicit on clean checkouts.
-            if splits_dir.exists() and any(splits_dir.glob("*.txt")):
-                print(
-                    f"WARNING: committed split files exist in '{splits_dir}' "
-                    f"but no real raw/mask pairs were found in "
-                    f"'{config['data']['raw_dir']}' / '{config['data']['masks_dir']}'; "
-                    "ignoring split files and using the synthetic fallback dataset."
-                )
 
-            # Smoke-test path: use the deterministic, magnification-stratified
-            # synthetic split shared with eval.py.
-            n_images = config.get("synthetic_n_images", 16)
-            splits = synthetic_split_names(n_images, seed=config["seed"])
-            train_names = set(splits["train"])
-            val_names = set(splits["val"])
-            train_pairs = [p for p in train_dataset.pairs if p[2] in train_names]
-            val_pairs = [p for p in train_dataset.pairs if p[2] in val_names]
-            train_dataset.pairs = train_pairs
-            val_dataset = _dataset_from_pairs(
-                val_pairs,
+        train_images = patches["train_images"]
+        train_masks = patches["train_masks"]
+        val_images = patches["val_images"]
+        val_masks = patches["val_masks"]
+
+        np_rng = np.random.default_rng()
+        np_rng.bit_generator.state = metadata["np_rng_state"]
+        jax_rng = jax.random.PRNGKey(metadata["jax_rng_key"][0])
+
+        start_epoch = int(metadata["epoch"]) + 1
+        best_dice = float(metadata["best_dice"])
+        patience_counter = int(metadata["patience_counter"])
+
+        log_path = logs_dir / "train_log.csv"
+        _truncate_log_to_epoch(log_path, int(metadata["epoch"]))
+        print(f"Resumed from epoch {metadata['epoch']}; continuing from epoch {start_epoch}.")
+    else:
+        # Fresh-run branch: build data, patches, and initialize state.
+        seed = config["seed"]
+        np_rng = np.random.default_rng(seed)
+        jax_rng = jax.random.PRNGKey(seed)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_dir, masks_dir, has_real = _ensure_data_dirs(config, Path(tmp))
+
+            splits_dir = Path(config["data"]["splits_dir"])
+            train_dataset = SpheroidDataset(
                 raw_dir,
                 masks_dir,
-                config["input_channels"],
-                config["class_mapping"],
+                input_channels=config["input_channels"],
+                class_mapping=config["class_mapping"],
             )
 
-        if len(train_dataset) == 0 or len(val_dataset) == 0:
-            raise ValueError(
-                "Train or validation set is empty. Provide real data or rely on synthetic fallback."
+            if has_real:
+                # Real-data mode: split files are required and authoritative.
+                if not splits_dir.exists() or not any(splits_dir.glob("*.txt")):
+                    raise ValueError(
+                        f"Real raw/mask pairs found in '{raw_dir}' / '{masks_dir}' "
+                        f"but no split files in '{splits_dir}'. "
+                        "Create splits with scripts/make_splits.py."
+                    )
+
+                from spheroid_seg.data.splits import load_splits
+
+                splits = load_splits(splits_dir)
+                train_names = set(splits["train"])
+                val_names = set(splits["val"])
+                train_pairs = [p for p in train_dataset.pairs if p[2] in train_names]
+                val_pairs = [p for p in train_dataset.pairs if p[2] in val_names]
+                train_dataset.pairs = train_pairs
+                val_dataset = _dataset_from_pairs(
+                    val_pairs, raw_dir, masks_dir, config["input_channels"], config["class_mapping"]
+                )
+            else:
+                # Synthetic fallback: ignore committed split files when no real pairs
+                # are present, but warn so the behavior is explicit on clean checkouts.
+                if splits_dir.exists() and any(splits_dir.glob("*.txt")):
+                    print(
+                        f"WARNING: committed split files exist in '{splits_dir}' "
+                        f"but no real raw/mask pairs were found in "
+                        f"'{config['data']['raw_dir']}' / '{config['data']['masks_dir']}'; "
+                        "ignoring split files and using the synthetic fallback dataset."
+                    )
+
+                # Smoke-test path: use the deterministic, magnification-stratified
+                # synthetic split shared with eval.py.
+                n_images = config.get("synthetic_n_images", 16)
+                splits = synthetic_split_names(n_images, seed=config["seed"])
+                train_names = set(splits["train"])
+                val_names = set(splits["val"])
+                train_pairs = [p for p in train_dataset.pairs if p[2] in train_names]
+                val_pairs = [p for p in train_dataset.pairs if p[2] in val_names]
+                train_dataset.pairs = train_pairs
+                val_dataset = _dataset_from_pairs(
+                    val_pairs,
+                    raw_dir,
+                    masks_dir,
+                    config["input_channels"],
+                    config["class_mapping"],
+                )
+
+            if len(train_dataset) == 0 or len(val_dataset) == 0:
+                raise ValueError(
+                    "Train or validation set is empty. "
+                    "Provide real data or rely on synthetic fallback."
+                )
+
+            print(
+                f"Training on {len(train_dataset)} images, validating on {len(val_dataset)} images."
             )
 
-        print(f"Training on {len(train_dataset)} images, validating on {len(val_dataset)} images.")
+            print("Building training patches...")
+            train_images, train_masks = _build_patch_arrays(
+                train_dataset, config, np_rng, augment=True
+            )
+            print(f"  {len(train_images)} training patches.")
 
-        print("Building training patches...")
-        train_images, train_masks = _build_patch_arrays(train_dataset, config, np_rng, augment=True)
-        print(f"  {len(train_images)} training patches.")
-
-        print("Building validation patches...")
-        val_images, val_masks = _build_patch_arrays(val_dataset, config, np_rng, augment=False)
-        print(f"  {len(val_images)} validation patches.")
+            print("Building validation patches...")
+            val_images, val_masks = _build_patch_arrays(val_dataset, config, np_rng, augment=False)
+            print(f"  {len(val_images)} validation patches.")
 
         steps_per_epoch = max(len(train_images) // config["batch_size"], 1)
         state = create_train_state(config, jax_rng, steps_per_epoch)
 
-        class_weights = jnp.array(config["class_weights"], dtype=jnp.float32)
-        num_classes = config["num_classes"]
-        batch_size = config["batch_size"]
-        epochs = epochs_override if epochs_override is not None else config["epochs"]
+        start_epoch = 1
+        best_dice = -1.0
+        patience_counter = 0
 
         log_path = logs_dir / "train_log.csv"
-        fieldnames = [
-            "epoch",
-            "train_loss",
-            "val_loss",
-            *{f"dice_class_{c}" for c in range(num_classes)},
-            "mean_dice",
-        ]
+
+    class_weights = jnp.array(config["class_weights"], dtype=jnp.float32)
+    num_classes = config["num_classes"]
+    batch_size = config["batch_size"]
+    epochs = epochs_override if epochs_override is not None else config["epochs"]
+    patience = config["early_stopping_patience"]
+    best_ckpt_path = checkpoints_dir / "best_checkpoint.msgpack"
+
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "val_loss",
+        *[f"dice_class_{c}" for c in range(num_classes)],
+        "mean_dice",
+    ]
+
+    # Write the header only on a fresh run (resume keeps the existing header).
+    if resume_from is None:
         with log_path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
-        if overfit_one_batch:
-            # Take the first full batch and repeatedly optimize on it.
-            overfit_batch = next(_batches(train_images, train_masks, batch_size, np_rng))
-            initial_loss = float(
-                segmentation_loss(
-                    state.apply_fn(
-                        {"params": state.params, "batch_stats": state.batch_stats},
-                        overfit_batch[0],
-                        train=False,
-                        mutable=False,
-                    ),
-                    overfit_batch[1],
-                    class_weights=class_weights,
-                )
+    if overfit_one_batch:
+        # Take the first full batch and repeatedly optimize on it.
+        overfit_batch = next(_batches(train_images, train_masks, batch_size, np_rng))
+        initial_loss = float(
+            segmentation_loss(
+                state.apply_fn(
+                    {"params": state.params, "batch_stats": state.batch_stats},
+                    overfit_batch[0],
+                    train=False,
+                    mutable=False,
+                ),
+                overfit_batch[1],
+                class_weights=class_weights,
             )
-            print(f"Overfit-one-batch initial loss: {initial_loss:.6f}")
-            for step in range(epochs):
-                state, loss = train_step(state, overfit_batch, class_weights)
-                if step % max(1, epochs // 10) == 0 or step == epochs - 1:
-                    print(f"  step {step:4d}: loss = {float(loss):.6f}")
-            final_loss = float(loss)
-            print(f"Overfit-one-batch final loss: {final_loss:.6f}")
-            save_checkpoint(state, epochs, checkpoints_dir / "overfit_checkpoint.msgpack")
-            return
+        )
+        print(f"Overfit-one-batch initial loss: {initial_loss:.6f}")
+        for step in range(epochs):
+            state, loss = train_step(state, overfit_batch, class_weights)
+            if step % max(1, epochs // 10) == 0 or step == epochs - 1:
+                print(f"  step {step:4d}: loss = {float(loss):.6f}")
+        final_loss = float(loss)
+        print(f"Overfit-one-batch final loss: {final_loss:.6f}")
+        save_checkpoint(state, epochs, checkpoints_dir / "overfit_checkpoint.msgpack")
+        return
 
-        best_dice = -1.0
-        patience_counter = 0
-        patience = config["early_stopping_patience"]
-        best_ckpt_path = checkpoints_dir / "best_checkpoint.msgpack"
+    for epoch in range(start_epoch, epochs + 1):
+        # Training
+        train_losses: list[float] = []
+        for batch in _batches(train_images, train_masks, batch_size, np_rng):
+            state, loss = train_step(state, batch, class_weights)
+            train_losses.append(float(loss))
 
-        for epoch in range(1, epochs + 1):
-            # Training
-            train_losses: list[float] = []
-            for batch in _batches(train_images, train_masks, batch_size, np_rng):
-                state, loss = train_step(state, batch, class_weights)
-                train_losses.append(float(loss))
+        # Validation
+        val_loss, val_dice = evaluate(
+            state,
+            val_images,
+            val_masks,
+            batch_size,
+            class_weights,
+            num_classes,
+            np_rng,
+        )
+        mean_dice = float(jnp.mean(val_dice))
+        train_loss = float(np.mean(train_losses))
 
-            # Validation
-            val_loss, val_dice = evaluate(
-                state,
-                val_images,
-                val_masks,
-                batch_size,
-                class_weights,
-                num_classes,
-                np_rng,
-            )
-            mean_dice = float(jnp.mean(val_dice))
-            train_loss = float(np.mean(train_losses))
+        row = {
+            "epoch": epoch,
+            "train_loss": f"{train_loss:.6f}",
+            "val_loss": f"{val_loss:.6f}",
+            **{f"dice_class_{c}": f"{float(val_dice[c]):.6f}" for c in range(num_classes)},
+            "mean_dice": f"{mean_dice:.6f}",
+        }
+        with log_path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writerow(row)
 
-            row = {
-                "epoch": epoch,
-                "train_loss": f"{train_loss:.6f}",
-                "val_loss": f"{val_loss:.6f}",
-                **{f"dice_class_{c}": f"{float(val_dice[c]):.6f}" for c in range(num_classes)},
-                "mean_dice": f"{mean_dice:.6f}",
-            }
-            with log_path.open("a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writerow(row)
+        print(
+            f"Epoch {epoch:3d}/{epochs}: train_loss={train_loss:.4f} "
+            f"val_loss={val_loss:.4f} mean_dice={mean_dice:.4f} "
+            f"dice={np.array(val_dice)}"
+        )
 
-            print(
-                f"Epoch {epoch:3d}/{epochs}: train_loss={train_loss:.4f} "
-                f"val_loss={val_loss:.4f} mean_dice={mean_dice:.4f} "
-                f"dice={np.array(val_dice)}"
-            )
+        if mean_dice > best_dice:
+            best_dice = mean_dice
+            patience_counter = 0
+            save_checkpoint(state, epoch, best_ckpt_path)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered at epoch {epoch}.")
+                break
 
-            if mean_dice > best_dice:
-                best_dice = mean_dice
-                patience_counter = 0
-                save_checkpoint(state, epoch, best_ckpt_path)
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    print(f"Early stopping triggered at epoch {epoch}.")
-                    break
+        # Always save the full training state at the end of each epoch so that
+        # a cloud-cut session can resume from the latest point.
+        save_training_state(
+            state,
+            epoch=epoch,
+            best_dice=best_dice,
+            patience_counter=patience_counter,
+            np_rng=np_rng,
+            jax_rng=jax_rng,
+            config=config,
+            train_images=train_images,
+            train_masks=train_masks,
+            val_images=val_images,
+            val_masks=val_masks,
+            checkpoints_dir=checkpoints_dir,
+        )
+
+
+def _resolve_resume_checkpoint(path: Path) -> Path:
+    """Resolve a --resume argument to a training_state.msgpack path."""
+    path = Path(path)
+    if path.is_file() and path.suffix == ".msgpack":
+        return path
+    if path.is_dir():
+        candidate = path / "checkpoints" / TRAINING_STATE_NAME
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not resolve resume checkpoint from '{path}'. "
+        f"Provide the path to {TRAINING_STATE_NAME} or to the run directory."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -481,20 +776,34 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Train on a single fixed synthetic batch for N steps (N = epochs).",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to a run directory or training_state.msgpack to resume from.",
+    )
     args = parser.parse_args(argv)
 
     config = load_config(Path(args.config))
-    timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d_%H%M%S")
-    run_name = f"{Path(args.config).stem}_{timestamp}"
-    run_dir = Path(config["outputs"]["checkpoints_dir"]).parent / "runs" / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Run directory: {run_dir}")
+
+    resume_arg = args.resume if args.resume is not None else config.get("resume")
+    if resume_arg is not None:
+        resume_checkpoint = _resolve_resume_checkpoint(Path(resume_arg))
+        run_dir = resume_checkpoint.parent.parent
+        print(f"Resuming run in directory: {run_dir}")
+    else:
+        timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y%m%d_%H%M%S")
+        run_name = f"{Path(args.config).stem}_{timestamp}"
+        run_dir = Path(config["outputs"]["checkpoints_dir"]).parent / "runs" / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Run directory: {run_dir}")
 
     train(
         config,
         run_dir=run_dir,
         overfit_one_batch=args.overfit_one_batch,
         epochs_override=args.epochs,
+        resume_from=resume_checkpoint if resume_arg is not None else None,
     )
     return 0
 

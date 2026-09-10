@@ -65,6 +65,68 @@ uv run python -m spheroid_seg.train --config configs/smoke.yaml --overfit-one-ba
 Every invocation writes to a unique `outputs/runs/<config>_<timestamp>/`
 directory, so runs never overwrite each other. `outputs/` is gitignored.
 
+## Resuming training
+
+Cloud sessions can be interrupted, so training is resumable from the latest
+epoch.  Resuming restores the full training state and continues in the **same**
+run directory, keeping `logs/train_log.csv` continuous.
+
+```bash
+# Train for a while, then stop (or let the session die).
+uv run python -m spheroid_seg.train --config configs/tiny.yaml --epochs 20
+
+# Resume from the latest epoch and train to 40 total epochs.
+uv run python -m spheroid_seg.train --config configs/tiny.yaml --epochs 40 \
+    --resume outputs/runs/tiny_20260821_123456/checkpoints/training_state.msgpack
+
+# The run directory also works:
+uv run python -m spheroid_seg.train --config configs/tiny.yaml --epochs 40 \
+    --resume outputs/runs/tiny_20260821_123456
+```
+
+A default resume path can also be set in the config file (`resume: <path>`);
+the CLI `--resume` flag takes precedence.  The config key is `null` in the
+shipped configs, which means "start fresh".
+
+### Checkpoint schema
+
+At the end of every epoch, `train.py` writes three files into
+`run_dir/checkpoints/`:
+
+| File | Contents |
+|---|---|
+| `training_state.msgpack` | Full `TrainState` (params, optimizer state including AdamW moments, global step, BatchNorm `batch_stats`) serialized with `flax.serialization`. |
+| `training_state_metadata.yaml` | `epoch`, `best_dice`, `patience_counter`, numpy RNG state, JAX RNG key, and a snapshot of the config used to start the original run. |
+| `training_patches.npz` | The exact train/validation patch arrays used by the loop, so that a resumed run sees the same augmented patches and batch order. |
+| `best_checkpoint.msgpack` | Legacy shallow checkpoint (`params`, `batch_stats`, `epoch`) kept for `eval.py` and `infer.py` compatibility. |
+
+The legacy `best_checkpoint.msgpack` is **not** sufficient for resume; resuming
+requires the three full-state files above.  If any of them is missing,
+`--resume` fails with a clear error rather than silently restoring partial
+state.
+
+### Config-mismatch policy
+
+When resuming, the current config is compared to the config snapshot stored in
+the checkpoint.  Most keys must match exactly; otherwise the run aborts with an
+error listing the differing keys.  This protects bit-identical resumption.
+
+Two keys may be deliberately overridden and are only logged as warnings:
+
+- `epochs` — e.g. extending a run from 100 to 150 epochs.
+- `early_stopping_patience` — e.g. giving a stalled run more patience.
+
+The entire `outputs` path block is ignored during comparison because output
+paths do not affect the training computation.
+
+### Log continuity
+
+On resume, `train.py` appends new epochs to the existing
+`logs/train_log.csv`.  The header is not duplicated, and epochs continue from
+the last completed epoch.  If the CSV ends with a partial line (e.g. the
+process was killed mid-write), that partial line is truncated before appending
+so the file stays parseable.
+
 ## Cloud GPU (Colab)
 
 `configs/base.yaml` (512² patches, 7.7M parameters) is impractical on CPU. A
