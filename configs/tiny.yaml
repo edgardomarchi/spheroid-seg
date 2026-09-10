@@ -57,6 +57,9 @@ outputs:
   qc_dir: outputs/qc
   debug_dir: outputs/debug
 
+# Resume training from a previous run (null = start fresh; CLI --resume overrides this)
+resume: null
+
 eval:
   batch_size: 2
   num_overlay_samples: 4
