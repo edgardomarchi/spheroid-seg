@@ -43,6 +43,13 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+The core stack (`jax`, `flax`, `optax`) is bounded to the range proven by the
+committed `uv.lock` (for example `jax>=0.10,<0.11`): JAX removes deprecated
+internals on minor releases, and unconstrained pip installs have resolved to
+incompatible combinations in the past. For development, `uv.lock` remains the
+reference resolution (`uv sync`); the bounds keep plain `pip` installs inside
+the same proven range.
+
 To also install the test tools, use a PEP 735 dependency group (requires
 **pip ≥ 25.1**):
 

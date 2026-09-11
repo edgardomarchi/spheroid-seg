@@ -18,9 +18,13 @@ classifiers = [
 ]
 
 dependencies = [
-    "jax",
-    "flax",
-    "optax",
+    # Core stack bounds: JAX removes deprecated internals on minor bumps
+    # (0.11.0 dropped jax.core.get_opaque_trace_state, breaking flax), so pip
+    # installs must not float past the range proven by uv.lock. Revisit these
+    # bounds deliberately as part of a planned stack upgrade.
+    "jax>=0.10.0,<0.11",
+    "flax>=0.12.8,<0.13",
+    "optax>=0.2.8,<0.3",
     "albumentations",
     "scikit-image",
     "scipy",

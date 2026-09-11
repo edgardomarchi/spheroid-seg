@@ -1,0 +1,40 @@
+name: Pip install check
+
+# Guards the pip install path used by the README quickstart and the Colab
+# notebook. Unlike the uv-based CI jobs, pip resolves without uv.lock, so
+# upstream releases that break unconstrained installs are only caught here.
+
+on:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/pip-install-check.yml"
+  schedule:
+    # Weekly upstream drift check (Mondays 06:23 UTC), even when the repo is quiet.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  pip-install-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # CPU runtime, matching the notebook's CPU path: editable install with
+      # pip only, deliberately without uv and without the committed lockfile.
+      - name: Install with pip (no uv, no lockfile)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[viz]"
+
+      - name: Import smoke check
+        run: python -c "import spheroid_seg; print(spheroid_seg.__version__)"
+
+      - name: Overfit-one-batch smoke train on CPU
+        run: python -m spheroid_seg.train --config configs/smoke.yaml --overfit-one-batch
