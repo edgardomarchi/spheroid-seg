@@ -434,3 +434,93 @@ def test_notebook_sets_xla_mem_fraction_for_training() -> None:
                     f"Cell {idx}: training run() must pass "
                     "env={{'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.9'}}"
                 )
+
+
+def _drive_resume_cell_index() -> int:
+    """Return the index of the training cell implementing Drive resume."""
+    for idx, source in _code_sources():
+        if "--resume" in source and "spheroid_seg.train" in source:
+            return idx
+    raise AssertionError("Drive-resume training cell not found")
+
+
+def _drive_resume_cell_source() -> str:
+    """Return the source of the training cell implementing Drive resume."""
+    return dict(_code_sources())[_drive_resume_cell_index()]
+
+
+def test_notebook_defines_force_fresh_flag() -> None:
+    """FORCE_FRESH is defined at the top of the notebook with a default of False."""
+    setup_source = next(source for _idx, source in _code_sources())
+    assert "FORCE_FRESH = False" in setup_source
+
+
+def test_notebook_training_cell_scans_drive_for_incomplete_run() -> None:
+    """The training cell scans Drive runs for unfinished training-state metadata."""
+    source = _drive_resume_cell_source()
+    assert "DRIVE_RUNS_DIR" in source
+    assert "training_state_metadata.yaml" in source
+    assert "FORCE_FRESH" in source
+
+
+def test_notebook_training_cell_calls_resume_on_detected_run() -> None:
+    """The training cell passes --resume <run dir> for the detected incomplete run."""
+    source = _drive_resume_cell_source()
+    assert '"--resume"' in source
+    assert "str(resume_run_dir)" in source
+
+
+def test_notebook_drive_config_written_under_content() -> None:
+    """The throwaway Drive config is written under /content, not into the repo."""
+    setup_source = next(source for _idx, source in _code_sources())
+    assert 'DRIVE_CONFIG_PATH = Path("/content/colab_drive.yaml")' in setup_source
+    source = _drive_resume_cell_source()
+    assert "DRIVE_CONFIG_PATH.write_text" in source
+
+
+def test_notebook_training_cell_verifies_drive_mount() -> None:
+    """The training cell verifies the Drive mount before using any Drive path."""
+    source = _drive_resume_cell_source()
+    assert 'os.path.ismount("/content/drive")' in source
+    assert "DRIVE_ROOT.exists()" in source
+
+
+def test_notebook_only_drive_data_cell_mounts_drive() -> None:
+    """drive.mount appears in exactly one cell: the Drive data-loading cell."""
+    mount_cells = [idx for idx, source in _code_sources() if "drive.mount" in source]
+    assert mount_cells == [_drive_code_cell_index()]
+
+
+def test_notebook_local_mode_warns_about_ephemeral_checkpoints() -> None:
+    """Without a verified Drive mount the training cell warns about ephemeral outputs."""
+    source = _drive_resume_cell_source()
+    assert "EPHEMERAL" in source
+
+
+def test_notebook_curves_cell_resolves_drive_run_dir() -> None:
+    """The training-curves cell resolves the log path with the same Drive detection."""
+    curves_idx = next(idx for idx, source in _code_sources() if "train_log.csv" in source)
+    source = dict(_code_sources())[curves_idx]
+    assert "os.path.ismount" in source
+    assert "DRIVE_RUNS_DIR" in source
+
+
+def test_notebook_download_cell_handles_drive_outputs() -> None:
+    """The zip/download cell prints the Drive path instead of archiving when on Drive."""
+    dl_idx = next(idx for idx, source in _code_sources() if "files.download" in source)
+    source = dict(_code_sources())[dl_idx]
+    assert "DRIVE_RUNS_DIR" in source
+
+
+def _markdown_sources() -> list[str]:
+    """Return the joined source of every markdown cell."""
+    return [
+        "".join(cell["source"]) for cell in _notebook()["cells"] if cell["cell_type"] == "markdown"
+    ]
+
+
+def test_notebook_documents_drive_resume() -> None:
+    """Notebook markdown explains the session-cut resume behavior and FORCE_FRESH."""
+    text = "\n".join(_markdown_sources())
+    assert "FORCE_FRESH" in text
+    assert "resume" in text.lower()
