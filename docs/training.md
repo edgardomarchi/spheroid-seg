@@ -15,8 +15,8 @@ configs/*.yaml ──► train.py ──► dataset + patching + augment (data p
                      │
                      ▼
         outputs/runs/<config>_<timestamp>/
-            ├── logs/train_log.csv      per-epoch losses and Dice
-            └── checkpoints/            best-by-mean-val-Dice kept
+            ├── logs/train_log.csv      per-epoch losses and Dice (macro + pooled)
+            └── checkpoints/            best-by-pooled-val-Dice kept
 ```
 
 ## Components
@@ -36,7 +36,38 @@ configs/*.yaml ──► train.py ──► dataset + patching + augment (data p
     and updated with `train=True`; the momentum is exposed as `bn_momentum`
     in the config so running statistics can be tuned for small batches.
   - logs every epoch to CSV and saves checkpoints; the checkpoint with the
-    highest mean validation Dice is kept as best.
+    highest pooled mean validation Dice is kept as best (see below).
+
+## Validation metrics
+
+Each epoch, validation reports **two** per-class Dice scores on the
+object-biased validation patch set:
+
+- **Macro Dice** (`mean_dice`, `dice_class_*` in `train_log.csv`): per-class
+  Dice computed per batch and averaged over batches. A class absent from both
+  prediction and target in a batch scores 1.0 there ("true negative"), so with
+  ~98.6% background most batches give the loose-cell class a free 1.0. This
+  systematically inflates rare-class scores: historical runs show patch-val
+  loose Dice ~0.43 while the same checkpoint predicts zero loose pixels on
+  full images. Kept as a patch-level diagnostic only — never compare it
+  against full-image eval numbers.
+- **Pooled Dice** (`val_dice_pooled_*`, `val_dice_pooled_mean`): a uint32
+  confusion matrix is accumulated over **all** validation batches and per-class
+  Dice is computed once per epoch — the same counting semantics as the
+  full-image eval (`accumulate_confusion_matrix` /
+  `class_metrics_from_confusion`). This is the model-selection metric:
+  `best_checkpoint.msgpack`, `best_dice`, and early-stopping patience all
+  follow `val_dice_pooled_mean`.
+
+Because validation still runs on the object-biased patch set
+(`object_patch_ratio: 0.8`), pooled patch-val Dice is comparable *in spirit*
+to the full-image eval but absolute agreement is not expected.
+
+Behavior change (2026-09-29): before this date, selection/early stopping used
+the macro average described above; `best_dice` in any checkpoint written
+before then is macro-based and is converted on resume (see *Log continuity*
+below). Historical patch-val numbers from those runs are inflated for rare
+classes.
 
 ## Configurations
 
@@ -96,7 +127,7 @@ At the end of every epoch, `train.py` writes three files into
 | File | Contents |
 |---|---|
 | `training_state.msgpack` | Full `TrainState` (params, optimizer state including AdamW moments, global step, BatchNorm `batch_stats`) serialized with `flax.serialization`. |
-| `training_state_metadata.yaml` | `epoch`, `best_dice`, `patience_counter`, numpy RNG state, JAX RNG key, and a snapshot of the config used to start the original run. |
+| `training_state_metadata.yaml` | `epoch`, `best_dice` (pooled mean Dice), `selection_metric`, `patience_counter`, numpy RNG state, JAX RNG key, and a snapshot of the config used to start the original run. |
 | `training_patches.npz` | The exact train/validation patch arrays used by the loop, so that a resumed run sees the same augmented patches and batch order. |
 | `best_checkpoint.msgpack` | Legacy shallow checkpoint (`params`, `batch_stats`, `epoch`) kept for `eval.py` and `infer.py` compatibility. |
 
@@ -126,6 +157,19 @@ On resume, `train.py` appends new epochs to the existing
 the last completed epoch.  If the CSV ends with a partial line (e.g. the
 process was killed mid-write), that partial line is truncated before appending
 so the file stays parseable.
+
+Runs started before pooled validation Dice existed have a CSV without the
+`val_dice_pooled_*` columns and a checkpoint metadata without
+`selection_metric`.  Resuming such a run **migrates the CSV in place**: the
+header gains the pooled columns and rows from before the upgrade keep their
+values with the new columns left empty (a layout that is neither the current
+header nor its exact legacy prefix is refused with an error, never silently
+mangled).  Because the old `best_dice` was macro-averaged, it is also
+converted on resume: the legacy best checkpoint is re-evaluated on the saved
+validation patches and its pooled mean Dice becomes the selection threshold
+for the rest of the run.  This keeps early stopping and best-model selection
+on the same scale instead of comparing pooled scores against an inflated
+macro threshold.
 
 ## Cloud GPU (Colab)
 
