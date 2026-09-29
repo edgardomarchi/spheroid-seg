@@ -24,6 +24,7 @@ from spheroid_seg.data.augment import apply_augmentation, build_augmentation
 from spheroid_seg.data.dataset import SpheroidDataset, has_real_pairs
 from spheroid_seg.data.patching import extract_patches
 from spheroid_seg.data.synthetic import generate_synthetic_dataset, synthetic_split_names
+from spheroid_seg.eval import CLASS_NAMES, accumulate_confusion_matrix, class_metrics_from_confusion
 from spheroid_seg.losses import segmentation_loss
 from spheroid_seg.metrics import dice_score
 from spheroid_seg.models.unet import UNet
@@ -44,6 +45,11 @@ TRAINING_PATCHES_NAME = "training_patches.npz"
 # Keys that may differ between the checkpoint's config and the resumed run's
 # config without aborting.  All other keys must match for bit-identical resume.
 OVERRIDABLE_KEYS = {"epochs", "early_stopping_patience"}
+
+# Validation metric used for best-model selection and early stopping.
+# Checkpoints written before pooled validation Dice existed carry no
+# ``selection_metric`` metadata and are treated as legacy (see ``train``).
+SELECTION_METRIC = "val_dice_pooled_mean"
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -270,8 +276,13 @@ def eval_step(
     batch: tuple[jnp.ndarray, jnp.ndarray],
     class_weights: jnp.ndarray,
     num_classes: int,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Execute one evaluation step and return loss + per-class Dice."""
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Execute one evaluation step and return loss, per-class Dice, and confusion.
+
+    The per-batch Dice is the patch-level diagnostic; the uint32 confusion
+    matrix is what ``evaluate`` accumulates across batches to compute pooled
+    per-class Dice with the same semantics as the full-image eval.
+    """
     images, masks = batch
     logits = state.apply_fn(
         {"params": state.params, "batch_stats": state.batch_stats},
@@ -282,7 +293,8 @@ def eval_step(
     loss = segmentation_loss(logits, masks, class_weights=class_weights)
     preds = jnp.argmax(logits, axis=-1)
     dice = dice_score(preds, masks, num_classes=num_classes)
-    return loss, dice
+    confusion = accumulate_confusion_matrix(preds, masks, num_classes)
+    return loss, dice, confusion
 
 
 def evaluate(
@@ -293,18 +305,32 @@ def evaluate(
     class_weights: jnp.ndarray,
     num_classes: int,
     rng: np.random.Generator,
-) -> tuple[float, jnp.ndarray]:
-    """Evaluate the model on a patch array and return average loss and Dice."""
+) -> tuple[float, jnp.ndarray, jnp.ndarray]:
+    """Evaluate the model on a patch array and return loss and Dice scores.
+
+    Returns:
+        Tuple of (mean loss, macro Dice, pooled Dice):
+
+        - ``macro Dice`` is the per-class mean over batches (the historical
+          validation metric). A class absent from both prediction and target
+          in a batch scores a free 1.0 there, so this inflates rare classes.
+        - ``pooled Dice`` is computed once per evaluation from the uint32
+          confusion matrix accumulated over all batches — the same counting
+          semantics as the full-image eval path.
+    """
     losses: list[float] = []
     dices: list[jnp.ndarray] = []
+    confusion = np.zeros((num_classes, num_classes), dtype=np.uint32)
     for batch in _batches(images, masks, batch_size, rng, shuffle=False):
-        loss, dice = eval_step(state, batch, class_weights, num_classes)
+        loss, dice, batch_confusion = eval_step(state, batch, class_weights, num_classes)
         losses.append(float(loss))
         dices.append(dice)
+        confusion += np.asarray(batch_confusion, dtype=np.uint32)
 
     mean_loss = float(np.mean(losses))
-    mean_dice = jnp.mean(jnp.stack(dices), axis=0)
-    return mean_loss, mean_dice
+    macro_dice = jnp.mean(jnp.stack(dices), axis=0)
+    pooled_dice = class_metrics_from_confusion(jnp.asarray(confusion))["dice"]
+    return mean_loss, macro_dice, pooled_dice
 
 
 def save_checkpoint(
@@ -352,6 +378,7 @@ def save_training_state(
     metadata = {
         "epoch": epoch,
         "best_dice": float(best_dice),
+        "selection_metric": SELECTION_METRIC,
         "patience_counter": int(patience_counter),
         "np_rng_state": np_rng.bit_generator.state,
         "jax_rng_key": [int(x) for x in np.asarray(jax_rng)],
@@ -474,6 +501,108 @@ def _truncate_log_to_epoch(log_path: Path, target_epoch: int) -> None:
         f.write("".join(kept))
 
 
+def _pooled_dice_columns(num_classes: int) -> list[str]:
+    """Return the per-class pooled-Dice column names for the CSV log."""
+    columns = []
+    for c in range(num_classes):
+        name = CLASS_NAMES[c] if c < len(CLASS_NAMES) else f"class {c}"
+        columns.append(f"val_dice_pooled_{name.replace(' ', '_')}")
+    return columns
+
+
+def _migrate_log_header(log_path: Path, fieldnames: list[str]) -> None:
+    """Pad a legacy ``train_log.csv`` with columns added after the run started.
+
+    Runs resumed across the introduction of pooled validation Dice carry a
+    CSV whose header predates the pooled columns.  The header is rewritten to
+    the new layout and existing rows keep their values, with the new columns
+    left empty for epochs logged before the change (appended fields are empty,
+    which ``csv.DictReader`` reports as "").  Layouts that are neither the
+    current header nor a prefix of it are rejected rather than silently
+    producing a malformed CSV.
+    """
+    if not log_path.exists():
+        return
+    with log_path.open("r", newline="") as f:
+        existing = next(csv.reader(f), None)
+    if existing is None:
+        existing = []
+    if list(existing) == list(fieldnames):
+        return
+    if len(existing) >= len(fieldnames) or list(fieldnames[: len(existing)]) != list(existing):
+        raise ValueError(
+            f"{log_path} has an unrecognized header {existing}; expected the current "
+            f"header or its legacy prefix {list(fieldnames)}. Refusing to append to a "
+            "CSV with an unexpected layout."
+        )
+
+    n_missing = len(fieldnames) - len(existing)
+    with log_path.open("r", newline="") as f:
+        lines = f.read().splitlines(keepends=True)
+    data_lines = lines[1:] if lines else []
+    padded = [line.rstrip("\r\n") + "," * n_missing + "\n" for line in data_lines]
+    with log_path.open("w", newline="") as f:
+        f.write(",".join(fieldnames) + "\n")
+        f.write("".join(padded))
+
+
+def _state_from_shallow_checkpoint(ckpt_path: Path, config: dict[str, Any]) -> TrainState:
+    """Restore a legacy ``best_checkpoint.msgpack`` into an evaluable TrainState."""
+    model = UNet(
+        num_classes=config["num_classes"],
+        base_features=config["base_features"],
+        input_channels=config["input_channels"],
+        bn_momentum=config.get("bn_momentum", 0.99),
+    )
+    channels = 1 if config["input_channels"] == "grayscale" else 3
+    dummy = jnp.ones((1, config["patch_size"], config["patch_size"], channels), dtype=jnp.float32)
+    variables = model.init(jax.random.PRNGKey(0), dummy, train=False)
+    target = {
+        "params": variables["params"],
+        "batch_stats": variables["batch_stats"],
+        "epoch": 0,
+    }
+    with ckpt_path.open("rb") as f:
+        ckpt = flax.serialization.from_bytes(target, f.read())
+    template = create_train_state(config, jax.random.PRNGKey(0), steps_per_epoch=1)
+    return template.replace(params=ckpt["params"], batch_stats=ckpt["batch_stats"])
+
+
+def _recompute_legacy_best_pooled_dice(
+    checkpoints_dir: Path,
+    config: dict[str, Any],
+    patches: dict[str, np.ndarray],
+) -> float:
+    """Recompute the best model's pooled mean Dice for a pre-change checkpoint.
+
+    Checkpoints written before pooled validation Dice stored a macro-averaged
+    ``best_dice``, which is not comparable to pooled scores.  The legacy best
+    model (``best_checkpoint.msgpack``) is re-evaluated on the validation
+    patches saved in the checkpoint, and its pooled mean Dice becomes the
+    selection threshold for the resumed run.  A dedicated RNG keeps the
+    training RNG stream untouched.
+    """
+    best_ckpt_path = checkpoints_dir / "best_checkpoint.msgpack"
+    if not best_ckpt_path.exists():
+        raise ValueError(
+            f"Cannot resume pre-pooled-Dice run: {best_ckpt_path} is missing, so the "
+            "macro-based best_dice cannot be converted to pooled Dice. "
+            "Finish this run with the training version that wrote it, or start a new run."
+        )
+    state = _state_from_shallow_checkpoint(best_ckpt_path, config)
+    class_weights = jnp.array(config["class_weights"], dtype=jnp.float32)
+    _loss, _macro, pooled_dice = evaluate(
+        state,
+        patches["val_images"],
+        patches["val_masks"],
+        config["batch_size"],
+        class_weights,
+        config["num_classes"],
+        np.random.default_rng(0),
+    )
+    return float(jnp.mean(pooled_dice))
+
+
 def _dataset_from_pairs(
     pairs: list[tuple[Path, Path, str]],
     raw_dir: Path,
@@ -540,6 +669,22 @@ def train(
         start_epoch = int(metadata["epoch"]) + 1
         best_dice = float(metadata["best_dice"])
         patience_counter = int(metadata["patience_counter"])
+
+        selection_metric = metadata.get("selection_metric")
+        if selection_metric != SELECTION_METRIC:
+            if selection_metric is not None:
+                raise ValueError(
+                    f"Checkpoint selection metric {selection_metric!r} is not supported; "
+                    f"expected {SELECTION_METRIC!r}."
+                )
+            # Pre-change checkpoint: best_dice holds the inflated macro-averaged
+            # score. Convert it to the pooled mean Dice of the legacy best model
+            # so the resumed run selects models on the same scale.
+            best_dice = _recompute_legacy_best_pooled_dice(checkpoints_dir, dict(config), patches)
+            print(
+                "Checkpoint predates pooled validation Dice: recomputed best_dice from "
+                f"the legacy best checkpoint (pooled mean Dice = {best_dice:.4f})."
+            )
 
         log_path = logs_dir / "train_log.csv"
         _truncate_log_to_epoch(log_path, int(metadata["epoch"]))
@@ -645,19 +790,25 @@ def train(
     patience = config["early_stopping_patience"]
     best_ckpt_path = checkpoints_dir / "best_checkpoint.msgpack"
 
+    pooled_columns = _pooled_dice_columns(num_classes)
     fieldnames = [
         "epoch",
         "train_loss",
         "val_loss",
         *[f"dice_class_{c}" for c in range(num_classes)],
         "mean_dice",
+        *pooled_columns,
+        "val_dice_pooled_mean",
     ]
 
-    # Write the header only on a fresh run (resume keeps the existing header).
+    # Write the header only on a fresh run. On resume the existing header is
+    # kept; if it predates the pooled columns, the file is migrated first.
     if resume_from is None:
         with log_path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
+    else:
+        _migrate_log_header(log_path, fieldnames)
 
     if overfit_one_batch:
         # Take the first full batch and repeatedly optimize on it.
@@ -692,7 +843,7 @@ def train(
             train_losses.append(float(loss))
 
         # Validation
-        val_loss, val_dice = evaluate(
+        val_loss, val_dice, val_dice_pooled = evaluate(
             state,
             val_images,
             val_masks,
@@ -702,6 +853,7 @@ def train(
             np_rng,
         )
         mean_dice = float(jnp.mean(val_dice))
+        pooled_mean_dice = float(jnp.mean(val_dice_pooled))
         train_loss = float(np.mean(train_losses))
 
         row = {
@@ -710,6 +862,8 @@ def train(
             "val_loss": f"{val_loss:.6f}",
             **{f"dice_class_{c}": f"{float(val_dice[c]):.6f}" for c in range(num_classes)},
             "mean_dice": f"{mean_dice:.6f}",
+            **{pooled_columns[c]: f"{float(val_dice_pooled[c]):.6f}" for c in range(num_classes)},
+            "val_dice_pooled_mean": f"{pooled_mean_dice:.6f}",
         }
         with log_path.open("a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -717,12 +871,13 @@ def train(
 
         print(
             f"Epoch {epoch:3d}/{epochs}: train_loss={train_loss:.4f} "
-            f"val_loss={val_loss:.4f} mean_dice={mean_dice:.4f} "
-            f"dice={np.array(val_dice)}"
+            f"val_loss={val_loss:.4f} mean_dice(macro)={mean_dice:.4f} "
+            f"pooled_mean_dice={pooled_mean_dice:.4f} "
+            f"dice={np.array(val_dice)} pooled_dice={np.array(val_dice_pooled)}"
         )
 
-        if mean_dice > best_dice:
-            best_dice = mean_dice
+        if pooled_mean_dice > best_dice:
+            best_dice = pooled_mean_dice
             patience_counter = 0
             save_checkpoint(state, epoch, best_ckpt_path)
         else:

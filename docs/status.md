@@ -4,7 +4,7 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-08-14 (first real-data baseline recorded; float32 accumulation bug fixed).
+Last updated: 2026-09-29 (validation Dice made pooled; selection/early stopping now use pooled mean Dice).
 
 ## Modules
 
@@ -139,6 +139,20 @@ pixels of one class. All numbers above are post-fix (verified run:
 - **D4 evidence (2026-08-14)**: no per-magnification failure signal so far
   (per-image background Dice 10x ≈ 4x), but val n is 2 vs 1 — evidence is weak.
   Single model stays; revisit with more data.
+- **Training validation metric fixed (2026-09-29)**: patch-val Dice was
+  macro-averaged per batch, giving rare classes a free 1.0 in batches where
+  they are absent (loose-cell patch-val 0.433 on run
+  `colab_drive_20260924_141820` vs ~0 predicted loose pixels in the full-image
+  eval of the same checkpoint — including on training-split images). Training
+  now accumulates a uint32 confusion matrix over all validation batches and
+  computes pooled per-class Dice once per epoch (same counting as the
+  full-image eval); best-checkpoint selection and early stopping follow the
+  pooled mean (`val_dice_pooled_mean`). The per-batch macro average is still
+  logged as a diagnostic. Historical patch-val numbers from runs before this
+  date are inflated for rare classes. Resuming a pre-change run migrates its
+  `train_log.csv` (new columns padded empty) and converts the macro-based
+  `best_dice` to the legacy best checkpoint's pooled mean Dice. See
+  `docs/training.md` §Validation metrics.
 
 ## Pending — v0.1 public release
 
