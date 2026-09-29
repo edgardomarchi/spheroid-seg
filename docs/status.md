@@ -4,7 +4,7 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-09-29 (validation Dice made pooled; selection/early stopping now use pooled mean Dice).
+Last updated: 2026-09-29 (eval now reports proper scoring rules — per-class Brier and log loss — alongside Dice/IoU).
 
 ## Modules
 
@@ -14,7 +14,7 @@ Last updated: 2026-09-29 (validation Dice made pooled; selection/early stopping 
 | M1 — Data pipeline | Done | dataset, patching (mask-guided), augmentation, synthetic fixtures; visual acceptance re-confirmed on 4 real annotated images; see `docs/data-pipeline.md` |
 | M2 — U-Net (Flax) | Done | from scratch, 7.7M params at base_features=32; BatchNorm `batch_stats` verified |
 | M3 — Training loop | Done | losses (Dice + weighted CE), metrics, TrainState + AdamW, unique run dirs, `--overfit-one-batch`; `bn_momentum` config param added/fixed (0.9 in base/colab) resolving val divergence on small data; see `docs/training.md`. 48 tests green, ruff clean |
-| M4 — Evaluation CLI | Done | per-class Dice/IoU, confusion, overlays, per-magnification grouping, checkpoint resolution; pooled confusion matrix now uses exact uint32 accumulation (fixed float32 saturation at 2**24); regression test added; see `docs/evaluation.md` |
+| M4 — Evaluation CLI | Done | per-class Dice/IoU, confusion, overlays, per-magnification grouping, checkpoint resolution; pooled confusion matrix now uses exact uint32 accumulation (fixed float32 saturation at 2**24); proper scoring rules (Brier + log loss from softmax probs, float64 streaming accumulation) added; see `docs/evaluation.md` |
 | M5 — Inference (stitching) | Done | full-image patch stitching with logit averaging; see `docs/inference.md` |
 | Notebook — Colab quickstart | Done | `notebooks/colab_training.ipynb` converted to pip-based install (`pip install -e ".[cuda12,viz]"` GPU / `pip install -e ".[viz]"` CPU), `USE_DRIVE_DATA` flag, streaming `run()` helper, pytest cell removed; `configs/colab.yaml` added for T4 16 GiB (batch_size 4); see `docs/training.md` |
 | CI — GitHub Actions | Done | lint + `pytest` matrix on Python 3.12/3.13/3.14; see `.github/workflows/ci.yml` |
@@ -139,6 +139,14 @@ pixels of one class. All numbers above are post-fix (verified run:
 - **D4 evidence (2026-08-14)**: no per-magnification failure signal so far
   (per-image background Dice 10x ≈ 4x), but val n is 2 vs 1 — evidence is weak.
   Single model stays; revisit with more data.
+- **Eval proper scoring rules added (2026-09-29)**: the eval path now reports
+  multiclass + per-class Brier score and overall + per-class conditional log
+  loss from the softmax probabilities (Gneiting & Raftery 2007), as new
+  `brier`/`log_loss` columns in `metrics.csv` plus an `all` row per group;
+  `object` rows are empty (post-hoc merge, not a softmax output) and absent
+  classes report NaN. Accumulated as float64 partial sums per tile, so peak
+  memory stays bounded by one image; probabilities are clipped to [1e-7, 1]
+  before log. See `docs/evaluation.md` §Proper scoring rules.
 - **Training validation metric fixed (2026-09-29)**: patch-val Dice was
   macro-averaged per batch, giving rare classes a free 1.0 in batches where
   they are absent (loose-cell patch-val 0.433 on run

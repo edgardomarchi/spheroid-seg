@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -303,15 +304,18 @@ def test_eval_cli_object_row_everywhere(trained_smoke_run: tuple[Path, Path]) ->
     assert eval_dirs, "No eval output directory created"
     eval_dir = eval_dirs[-1]
 
-    # CSV: one object row per group.
+    # CSV: one object row per group. Proper scores are undefined for the
+    # post-hoc object merge, so its brier/log_loss cells stay empty.
     rows = list(csv.reader((eval_dir / "metrics.csv").open("r", newline="")))
-    assert rows[0] == ["group", "class", "dice", "iou", "n_images"]
+    assert rows[0] == ["group", "class", "dice", "iou", "brier", "log_loss", "n_images"]
     object_rows = [row for row in rows[1:] if row[1] == "object"]
     groups = {row[0] for row in object_rows}
     assert {"overall", "4x", "10x"}.issubset(groups)
     for row in object_rows:
         assert 0.0 <= float(row[2]) <= 1.0
         assert 0.0 <= float(row[3]) <= 1.0
+        assert row[4] == ""
+        assert row[5] == ""
 
     # Stdout summary table contains object rows.
     stdout = result.stdout
@@ -338,3 +342,54 @@ def test_eval_cli_object_row_everywhere(trained_smoke_run: tuple[Path, Path]) ->
     for entry in metrics["per_image"]:
         assert "object_dice" in entry
         assert "object_iou" in entry
+
+
+def test_eval_cli_proper_score_columns(trained_smoke_run: tuple[Path, Path]) -> None:
+    """Brier and log loss appear in metrics.csv for every group and in metrics.json.
+
+    Class rows carry per-class one-vs-rest Brier / conditional log loss, the
+    extra ``all`` row carries the pooled multiclass Brier / overall log loss,
+    and the ``object`` row leaves both cells empty.
+    """
+    config_path, _ = trained_smoke_run
+    result = _run_eval(config_path, split="val")
+    assert result.returncode == 0, result.stderr
+
+    config = yaml.safe_load(config_path.read_text())
+    evals_dir = Path(config["outputs"]["checkpoints_dir"]).parent / "evals"
+    eval_dirs = sorted(evals_dir.glob(f"{config_path.stem}_*"), key=lambda p: p.stat().st_mtime)
+    assert eval_dirs, "No eval output directory created"
+    eval_dir = eval_dirs[-1]
+
+    rows = list(csv.DictReader((eval_dir / "metrics.csv").open("r", newline="")))
+    groups = {row["group"] for row in rows}
+    assert {"overall", "4x", "10x"}.issubset(groups)
+
+    for group in ("overall", "4x", "10x"):
+        class_rows = [row for row in rows if row["group"] == group and row["class"] != "object"]
+        model_rows = [row for row in class_rows if row["class"] != "all"]
+        assert len(model_rows) == config["num_classes"]
+        for row in model_rows:
+            brier, log_loss = float(row["brier"]), float(row["log_loss"])
+            assert 0.0 <= brier <= 2.0  # multiclass Brier range for valid distributions
+            assert 0.0 <= log_loss <= -math.log(1e-7) + 0.1  # epsilon clip bound
+        all_rows = [row for row in class_rows if row["class"] == "all"]
+        assert len(all_rows) == 1
+        assert 0.0 <= float(all_rows[0]["brier"]) <= 2.0
+        assert 0.0 <= float(all_rows[0]["log_loss"]) <= -math.log(1e-7) + 0.1
+        # Dice/IoU cells of the all row stay empty; dice/iou columns are untouched.
+        assert all_rows[0]["dice"] == ""
+        assert all_rows[0]["iou"] == ""
+
+    # metrics.json mirrors the CSV values.
+    metrics = json.loads((eval_dir / "metrics.json").read_text())
+    overall = metrics["overall"]
+    for key in ("brier", "brier_all", "log_loss", "log_loss_all"):
+        assert key in overall, f"missing {key} in metrics.json overall"
+    assert len(overall["brier"]) == config["num_classes"]
+    assert len(overall["log_loss"]) == config["num_classes"]
+    assert all(0.0 <= v <= 2.0 for v in overall["brier"])
+    assert all(np.isfinite(overall["log_loss"]))
+    for mag, group in metrics["per_magnification"].items():
+        for key in ("brier", "brier_all", "log_loss", "log_loss_all"):
+            assert key in group, f"missing {key} in metrics.json per_magnification[{mag}]"
