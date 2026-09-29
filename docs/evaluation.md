@@ -12,7 +12,7 @@ configs/*.yaml ──► eval.py ──► resolve checkpoint
                       ├─ dataset.py   real pairs from data/splits/<split>.txt
                       ├─ synthetic.py  deterministic fallback when no real data
                       ├─ tiling.py    full-image tile / predict / reassemble
-                      ├─ metrics.py   per-class Dice / IoU + confusion matrix
+                      ├─ metrics.py   per-class Dice / IoU + confusion matrix + proper scoring rules
                       ├─ metadata.py  magnification parsing (filename / CSV)
                       └─ overlays.py  OpenCV grid: raw | GT | pred | errors
                       │
@@ -153,6 +153,44 @@ background row is redundant with the existing background class.
 The object row appears in `metrics.csv`, `metrics.json`, the stdout summary
 table, and a separate `confusion_matrix_object.csv`. The 3x3 confusion matrix
 is unchanged.
+
+## Proper scoring rules (Brier score and log loss)
+
+Dice/IoU evaluate the post-argmax mask: they say nothing about the quality or
+calibration of the predicted probabilities. This matters here because training
+deliberately de-calibrates probabilities (class-weighted cross-entropy with a
+low background weight) and because ~98.6% background pixels would dominate any
+pooled score unless it is also reported per class. The eval therefore reports
+two strictly proper scoring rules (Gneiting & Raftery 2007, JASA 102(477))
+computed from the softmax probabilities, never from the argmax mask:
+
+- `brier` — per-class one-vs-rest Brier score: mean over pixels of
+  `(p_c − y_c)²`, with `y` the one-hot ground truth. Defined for every class
+  (an absent class scores `mean(p_c²)`).
+- `log_loss` — per-class conditional log loss: `−mean(log p_true)` restricted
+  to pixels whose ground-truth class is `c`; it measures calibration *within*
+  each class's GT region. A class absent from the GT has no such pixels: the
+  value is NaN (empty cell in `metrics.csv`), never an invented convention.
+- The extra `all` row per group carries the pooled multiclass Brier score
+  (mean over pixels of `Σ_c (p_c − y_c)²`, range [0, 2]) and the overall log
+  loss (`−mean(log p_true)` over all pixels).
+- The `object` row leaves both cells empty: object is a post-hoc merge of two
+  softmax classes, not a model output, so no probabilities exist for it.
+
+Implementation notes:
+
+- Input convention: probabilities (softmax output), not logits.
+- Probabilities are clipped to `[1e-7, 1]` before `log` (fixed deterministic
+  constant, not a config key, so scores stay comparable across runs).
+- Accumulated as float64 running sums + int64 pixel counts per class, group,
+  and overall — per-pixel probability maps are never retained beyond the
+  current tile/batch (same streaming contract as the confusion matrix).
+
+Schema: `metrics.csv` gains `brier` and `log_loss` columns alongside
+`dice`/`iou`; each group block (overall + per magnification) is the three
+class rows, the `object` row, and the `all` row. `metrics.json` gains `brier`,
+`brier_all`, `log_loss`, and `log_loss_all` under `overall` and each
+`per_magnification` entry.
 
 ## Known limitations
 

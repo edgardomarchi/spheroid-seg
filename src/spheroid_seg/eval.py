@@ -6,6 +6,7 @@ import argparse
 import csv
 import datetime
 import json
+import math
 import os
 import sys
 import tempfile
@@ -30,6 +31,12 @@ from spheroid_seg.data.metadata import parse_magnification
 from spheroid_seg.data.splits import load_split_list
 from spheroid_seg.data.synthetic import generate_synthetic_dataset, synthetic_split_names
 from spheroid_seg.data.tiling import extract_tiles, reassemble_from_tiles
+from spheroid_seg.metrics import (
+    add_proper_score_sums,
+    empty_proper_score_sums,
+    finalize_proper_scores,
+    proper_score_partial_sums,
+)
 from spheroid_seg.models.unet import UNet
 from spheroid_seg.overlays import (
     assemble_overlay_grid,
@@ -95,7 +102,12 @@ def load_model_and_checkpoint(
 
 
 def _make_predict_fn(apply_fn: Any) -> Any:
-    """Build a JIT-compiled deterministic prediction function."""
+    """Build a JIT-compiled deterministic prediction function.
+
+    Returns per-tile softmax probabilities (float32, ``(B, T, T, C)``) rather
+    than argmax masks: proper scoring rules (Brier, log loss) are computed from
+    the probabilities, and the argmax is taken per tile afterwards.
+    """
 
     @jax.jit
     def predict(params: Any, batch_stats: Any, images: jnp.ndarray) -> jnp.ndarray:
@@ -105,9 +117,39 @@ def _make_predict_fn(apply_fn: Any) -> Any:
             train=False,
             mutable=False,
         )
-        return jnp.argmax(logits, axis=-1)
+        return jax.nn.softmax(logits, axis=-1)
 
     return predict
+
+
+def _tile_valid_slices(padding: dict[str, Any]) -> list[tuple[int, int, int, int]]:
+    """Per-tile ``(row_start, row_end, col_start, col_end)`` slices excluding reflect padding.
+
+    ``extract_tiles`` reflect-pads images that are not divisible by the tile
+    size; those reflected pixels are not real image pixels, so the proper
+    scores must only accumulate on the valid (interior) region of each tile.
+    With zero padding every slice is the full tile.
+    """
+    tile_size = padding["tile_size"]
+    n_h, n_w = padding["n_h"], padding["n_w"]
+    padded_h, padded_w = n_h * tile_size, n_w * tile_size
+    row_lo, row_hi = padding["pad_top"], padded_h - padding["pad_bottom"]
+    col_lo, col_hi = padding["pad_left"], padded_w - padding["pad_right"]
+
+    slices = []
+    for idx in range(n_h * n_w):
+        tile_row, tile_col = divmod(idx, n_w)
+        r0 = tile_row * tile_size
+        c0 = tile_col * tile_size
+        slices.append(
+            (
+                max(r0, row_lo) - r0,
+                min(r0 + tile_size, row_hi) - r0,
+                max(c0, col_lo) - c0,
+                min(c0 + tile_size, col_hi) - c0,
+            )
+        )
+    return slices
 
 
 def _find_file_with_stem(directory: Path, stem: str) -> Path | None:
@@ -174,22 +216,53 @@ def _predict_full_image(
     params: Any,
     batch_stats: Any,
     image: np.ndarray,
+    mask: np.ndarray,
     tile_size: int,
     batch_size: int,
-) -> np.ndarray:
-    """Tile a full image, predict each tile, and reassemble the prediction."""
+    num_classes: int,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Tile a full image, predict each tile, and reassemble the argmax prediction.
+
+    Proper scoring rules (Brier, log loss) are accumulated per tile as float64
+    partial sums over the valid (non-reflect-padded) region of each tile against
+    the corresponding ground-truth tile; per-pixel probability maps are never
+    retained beyond the current batch.
+
+    Returns:
+        Tuple of ``(argmax prediction mask, proper-score partial sums for this
+        image)``.
+    """
     tiles, padding = extract_tiles(image, tile_size)
     if tiles.ndim == 3:
         tiles = tiles[..., np.newaxis]
+    mask_tiles, mask_padding = extract_tiles(mask, tile_size)
+    if (mask_padding["pad_top"], mask_padding["pad_left"]) != (
+        padding["pad_top"],
+        padding["pad_left"],
+    ):
+        raise ValueError("Image and mask tiling produced different padding.")
 
+    valid_slices = _tile_valid_slices(padding)
+    proper_sums = empty_proper_score_sums(num_classes)
     pred_tiles: list[np.ndarray] = []
     for start in range(0, len(tiles), batch_size):
         batch = jnp.array(tiles[start : start + batch_size], dtype=jnp.float32)
-        preds = predict_fn(params, batch_stats, batch)
-        pred_tiles.append(np.asarray(preds))
+        probs = np.asarray(predict_fn(params, batch_stats, batch))
+        for offset in range(len(probs)):
+            idx = start + offset
+            r0, r1, c0, c1 = valid_slices[idx]
+            add_proper_score_sums(
+                proper_sums,
+                proper_score_partial_sums(
+                    probs[offset, r0:r1, c0:c1],
+                    mask_tiles[idx, r0:r1, c0:c1],
+                    num_classes,
+                ),
+            )
+        pred_tiles.append(np.argmax(probs, axis=-1).astype(np.uint8))
 
-    pred_tiles = np.concatenate(pred_tiles, axis=0)
-    return reassemble_from_tiles(pred_tiles, padding)
+    pred_tiles_arr = np.concatenate(pred_tiles, axis=0)
+    return reassemble_from_tiles(pred_tiles_arr, padding), proper_sums
 
 
 def accumulate_confusion_matrix(
@@ -317,6 +390,12 @@ def group_by_magnification(
     return groups
 
 
+def _score_cell(value: Any) -> Any:
+    """CSV cell for a proper score: empty for NaN/undefined, the float otherwise."""
+    v = float(value)
+    return "" if math.isnan(v) else v
+
+
 def _write_outputs(
     output_dir: Path,
     metrics: dict[str, Any],
@@ -328,57 +407,65 @@ def _write_outputs(
 
     Writes the original 3x3 ``confusion_matrix.csv`` plus an optional
     ``confusion_matrix_object.csv`` (2x2 virtual bg/object) derived from it.
-    ``overlay_samples`` carries pixel data only for the images selected as
-    overlay panels, pre-rendered at panel width; selection is re-applied here
-    to fix the row order.
+    ``metrics.csv`` has one block per group (overall + each magnification):
+    one row per model class with per-class one-vs-rest Brier and conditional
+    log loss, an ``object`` row with the proper-score cells left empty (the
+    object class is a post-hoc merge of two softmax classes, not a model
+    output), and an ``all`` row with the pooled multiclass Brier and overall
+    log loss over all pixels and classes. ``overlay_samples`` carries pixel
+    data only for the images selected as overlay panels, pre-rendered at panel
+    width; selection is re-applied here to fix the row order.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
 
+    def _class_rows(group_name: str, group: dict[str, Any]) -> list[list[Any]]:
+        rows = [
+            [
+                group_name,
+                class_name,
+                group["dice"][idx],
+                group["iou"][idx],
+                _score_cell(group["brier"][idx]),
+                _score_cell(group["log_loss"][idx]),
+                group["n_images"],
+            ]
+            for idx, class_name in enumerate(CLASS_NAMES[: config["num_classes"]])
+        ]
+        rows.append(
+            [
+                group_name,
+                "object",
+                group["object_dice"],
+                group["object_iou"],
+                "",
+                "",
+                group["n_images"],
+            ]
+        )
+        rows.append(
+            [
+                group_name,
+                "all",
+                "",
+                "",
+                _score_cell(group["brier_all"]),
+                _score_cell(group["log_loss_all"]),
+                group["n_images"],
+            ]
+        )
+        return rows
+
     num_classes = config["num_classes"]
     with (output_dir / "metrics.csv").open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["group", "class", "dice", "iou", "n_images"])
-        for idx, class_name in enumerate(CLASS_NAMES[:num_classes]):
-            writer.writerow(
-                [
-                    "overall",
-                    class_name,
-                    metrics["overall"]["dice"][idx],
-                    metrics["overall"]["iou"][idx],
-                    n_images,
-                ]
-            )
-        writer.writerow(
-            [
-                "overall",
-                "object",
-                metrics["overall"]["object_dice"],
-                metrics["overall"]["object_iou"],
-                n_images,
-            ]
-        )
+        writer.writerow(["group", "class", "dice", "iou", "brier", "log_loss", "n_images"])
+        overall_group = dict(metrics["overall"])
+        overall_group["n_images"] = n_images
+        writer.writerows(_class_rows("overall", overall_group))
         for mag, group in metrics["per_magnification"].items():
-            for idx, class_name in enumerate(CLASS_NAMES[:num_classes]):
-                writer.writerow(
-                    [
-                        mag,
-                        class_name,
-                        group["dice"][idx],
-                        group["iou"][idx],
-                        group["n_images"],
-                    ]
-                )
-            writer.writerow(
-                [
-                    mag,
-                    "object",
-                    group["object_dice"],
-                    group["object_iou"],
-                    group["n_images"],
-                ]
-            )
+            writer.writerows(_class_rows(mag, group))
 
     with (output_dir / "confusion_matrix.csv").open("w", newline="") as f:
         writer = csv.writer(f)
@@ -425,28 +512,44 @@ def _make_output_dir(config: dict[str, Any], config_path: Path | str) -> Path:
     return output_dir
 
 
+def _fmt_score(value: Any) -> str:
+    """Right-aligned score cell for the stdout summary (NaN prints as 'nan')."""
+    return f"{float(value):>8.4f}"
+
+
 def _print_summary(metrics: dict[str, Any]) -> None:
     """Print a compact summary table to stdout."""
     print("\nEvaluation summary")
-    print("-" * 60)
-    print(f"{'Group':<12} {'Class':<14} {'Dice':>8} {'IoU':>8}")
-    print("-" * 60)
-    for idx, class_name in enumerate(metrics["class_names"]):
-        print(
-            f"{'overall':<12} {class_name:<14} "
-            f"{metrics['overall']['dice'][idx]:>8.4f} {metrics['overall']['iou'][idx]:>8.4f}"
+    print("-" * 76)
+    print(f"{'Group':<12} {'Class':<14} {'Dice':>8} {'IoU':>8} {'Brier':>8} {'LogLoss':>8}")
+    print("-" * 76)
+
+    def _rows(group_name: str, group: dict[str, Any]) -> list[str]:
+        lines = [
+            f"{group_name:<12} {class_name:<14} "
+            f"{group['dice'][idx]:>8.4f} {group['iou'][idx]:>8.4f} "
+            f"{_fmt_score(group['brier'][idx])} {_fmt_score(group['log_loss'][idx])}"
+            for idx, class_name in enumerate(metrics["class_names"])
+        ]
+        # object: proper scores are undefined (post-hoc merge, not a softmax output).
+        lines.append(
+            f"{group_name:<12} {'object':<14} "
+            f"{group['object_dice']:>8.4f} {group['object_iou']:>8.4f} "
+            f"{'':>8} {'':>8}"
         )
-    print(
-        f"{'overall':<12} {'object':<14} "
-        f"{metrics['overall']['object_dice']:>8.4f} {metrics['overall']['object_iou']:>8.4f}"
-    )
+        lines.append(
+            f"{group_name:<12} {'all':<14} "
+            f"{'':>8} {'':>8} "
+            f"{_fmt_score(group['brier_all'])} {_fmt_score(group['log_loss_all'])}"
+        )
+        return lines
+
+    for line in _rows("overall", metrics["overall"]):
+        print(line)
     for mag, group in sorted(metrics["per_magnification"].items()):
-        for idx, class_name in enumerate(metrics["class_names"]):
-            print(
-                f"{mag:<12} {class_name:<14} {group['dice'][idx]:>8.4f} {group['iou'][idx]:>8.4f}"
-            )
-        print(f"{mag:<12} {'object':<14} {group['object_dice']:>8.4f} {group['object_iou']:>8.4f}")
-    print("-" * 60)
+        for line in _rows(mag, group):
+            print(line)
+    print("-" * 76)
 
 
 def evaluate_split(
@@ -465,7 +568,8 @@ def evaluate_split(
     independent of split size.
 
     Outputs are written to a unique ``outputs/evals/<config>_<timestamp>/``
-    directory: ``metrics.json``, ``metrics.csv``, ``confusion_matrix.csv``,
+    directory: ``metrics.json``, ``metrics.csv`` (per-class Dice/IoU plus Brier
+    and log-loss proper scoring rules), ``confusion_matrix.csv``,
     ``confusion_matrix_object.csv``, and ``overlays_grid.png``.
 
     Returns:
@@ -499,6 +603,8 @@ def evaluate_split(
         }
 
         global_confusion = np.zeros((num_classes, num_classes), dtype=np.uint32)
+        overall_proper_sums = empty_proper_score_sums(num_classes)
+        group_proper_sums: dict[str, dict[str, np.ndarray]] = {}
         group_confusions: dict[str, np.ndarray] = {}
         group_dices: dict[str, list[np.ndarray]] = {}
         group_ious: dict[str, list[np.ndarray]] = {}
@@ -516,18 +622,22 @@ def evaluate_split(
                 input_channels=input_channels,
                 class_mapping=class_mapping,
             )
-            pred = _predict_full_image(
+            pred, proper_sums = _predict_full_image(
                 predict_fn,
                 ckpt["params"],
                 ckpt["batch_stats"],
                 image,
+                mask,
                 tile_size=config["patch_size"],
                 batch_size=eval_batch_size,
+                num_classes=num_classes,
             )
 
             # Per-image confusion first; every pooled matrix below is the exact
             # integer sum of per-image matrices (uint32 accumulation, as
-            # documented in accumulate_confusion_matrix).
+            # documented in accumulate_confusion_matrix). Proper scores are the
+            # exact float64 sum of per-tile partial sums, folded into the
+            # overall and per-magnification accumulators.
             conf = np.asarray(accumulate_confusion_matrix(pred, mask, num_classes))
             pooled = class_metrics_from_confusion(conf)
             obj = object_metrics_from_3x3(conf)
@@ -535,6 +645,11 @@ def evaluate_split(
 
             global_confusion += conf
             group_confusions[mag] = group_confusions.get(mag, np.zeros_like(conf)) + conf
+            add_proper_score_sums(overall_proper_sums, proper_sums)
+            add_proper_score_sums(
+                group_proper_sums.setdefault(mag, empty_proper_score_sums(num_classes)),
+                proper_sums,
+            )
             dice, iou = _dice_iou_from_confusion(conf)
             group_dices.setdefault(mag, []).append(dice)
             group_ious.setdefault(mag, []).append(iou)
@@ -568,17 +683,23 @@ def evaluate_split(
 
         overall = class_metrics_from_confusion(global_confusion)
         overall_object = object_metrics_from_3x3(global_confusion)
+        overall_scores = finalize_proper_scores(overall_proper_sums, num_classes)
 
         per_magnification: dict[str, Any] = {}
         for mag in sorted(group_confusions.keys()):
             conf = group_confusions[mag]
             pooled = class_metrics_from_confusion(conf)
             obj = object_metrics_from_3x3(conf)
+            group_scores = finalize_proper_scores(group_proper_sums[mag], num_classes)
             per_magnification[mag] = {
                 "dice": np.asarray(pooled["dice"]).tolist(),
                 "iou": np.asarray(pooled["iou"]).tolist(),
                 "object_dice": float(obj["dice"]),
                 "object_iou": float(obj["iou"]),
+                "brier": np.asarray(group_scores["brier_per_class"]).tolist(),
+                "brier_all": float(group_scores["brier"]),
+                "log_loss": np.asarray(group_scores["log_loss_per_class"]).tolist(),
+                "log_loss_all": float(group_scores["log_loss"]),
                 "per_image": {
                     "mean_dice": np.mean(group_dices[mag], axis=0).tolist(),
                     "std_dice": np.std(group_dices[mag], axis=0).tolist(),
@@ -598,6 +719,10 @@ def evaluate_split(
                 "iou": np.asarray(overall["iou"]).tolist(),
                 "object_dice": float(overall_object["dice"]),
                 "object_iou": float(overall_object["iou"]),
+                "brier": np.asarray(overall_scores["brier_per_class"]).tolist(),
+                "brier_all": float(overall_scores["brier"]),
+                "log_loss": np.asarray(overall_scores["log_loss_per_class"]).tolist(),
+                "log_loss_all": float(overall_scores["log_loss"]),
             },
             "per_magnification": per_magnification,
             "per_image": per_image,
