@@ -144,6 +144,60 @@ def select_overlay_samples(
     return selected
 
 
+def build_overlay_panels(sample: dict[str, Any], panel_width: int) -> list[np.ndarray]:
+    """Render the four grid panels of one sample at panel resolution.
+
+    Produces exactly the panels :func:`build_overlay_grid` places in a row —
+    raw | ground truth | prediction | error overlay — each resized to
+    ``(panel_width, panel_width)``. Splitting panel rendering from grid
+    assembly lets eval stream: panels are rendered while the full-resolution
+    image is still in memory and only the small resized panels are retained.
+
+    Args:
+        sample: Sample dictionary with keys ``raw`` (grayscale uint8),
+            ``gt`` (uint8 label mask), and ``pred`` (uint8 label mask).
+        panel_width: Width and height of each square panel in pixels.
+
+    Returns:
+        List of four BGR uint8 panels of shape ``(panel_width, panel_width, 3)``,
+        in grid column order.
+    """
+    panels = [
+        _gray_to_rgb(sample["raw"]),
+        _colorize_mask(sample["gt"]),
+        _colorize_mask(sample["pred"]),
+        _build_error_overlay(sample["raw"], sample["gt"], sample["pred"]),
+    ]
+    return [cv2.resize(panel, (panel_width, panel_width)) for panel in panels]
+
+
+def assemble_overlay_grid(samples: list[dict[str, Any]], panel_width: int) -> np.ndarray:
+    """Assemble a grid from pre-rendered panels (see :func:`build_overlay_panels`).
+
+    Args:
+        samples: List of sample dictionaries with keys ``panels`` (list of four
+            BGR uint8 panels), ``name``, and ``magnification``.
+        panel_width: Width and height of each square panel in pixels.
+
+    Returns:
+        BGR uint8 grid image of shape ``(N * panel_width, 4 * panel_width, 3)``.
+    """
+    n_rows = len(samples)
+    grid = np.zeros((n_rows * panel_width, 4 * panel_width, 3), dtype=np.uint8)
+
+    for row, sample in enumerate(samples):
+        for col, resized in enumerate(sample["panels"]):
+            x_start = col * panel_width
+            y_start = row * panel_width
+            grid[y_start : y_start + panel_width, x_start : x_start + panel_width] = resized
+
+        label = f"{sample['name']} ({sample['magnification']})"
+        _add_row_label(grid, row, panel_width, label)
+        _add_error_legend(grid, row, panel_width)
+
+    return grid
+
+
 def build_overlay_grid(
     samples: list[dict[str, Any]],
     panel_width: int,
@@ -163,29 +217,7 @@ def build_overlay_grid(
     Returns:
         BGR uint8 grid image of shape ``(N * panel_width, 4 * panel_width, 3)``.
     """
-    n_rows = len(samples)
-    grid = np.zeros((n_rows * panel_width, 4 * panel_width, 3), dtype=np.uint8)
-
-    for row, sample in enumerate(samples):
-        raw = sample["raw"]
-        gt = sample["gt"]
-        pred = sample["pred"]
-
-        panels = [
-            _gray_to_rgb(raw),
-            _colorize_mask(gt),
-            _colorize_mask(pred),
-            _build_error_overlay(raw, gt, pred),
-        ]
-
-        for col, panel in enumerate(panels):
-            resized = cv2.resize(panel, (panel_width, panel_width))
-            x_start = col * panel_width
-            y_start = row * panel_width
-            grid[y_start : y_start + panel_width, x_start : x_start + panel_width] = resized
-
-        label = f"{sample['name']} ({sample['magnification']})"
-        _add_row_label(grid, row, panel_width, label)
-        _add_error_legend(grid, row, panel_width)
-
-    return grid
+    rendered = [
+        {**sample, "panels": build_overlay_panels(sample, panel_width)} for sample in samples
+    ]
+    return assemble_overlay_grid(rendered, panel_width)

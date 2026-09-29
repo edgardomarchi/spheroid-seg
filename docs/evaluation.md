@@ -102,6 +102,16 @@ Given the same config and checkpoint, two identical eval invocations produce
 identical `metrics.json` files and pixel-identical overlay grids. The output
 directory uses a timestamp, so multiple runs never overwrite each other.
 
+## Memory behavior
+
+Evaluation is streaming by design: it loads one image, predicts, folds the
+result into the pooled confusion counts and per-image scalar metrics, then
+releases the image. Only the small aggregated state and the few overlay panels
+selected for the grid are retained, so peak RSS stays bounded by one image
+plus the overlay sample budget regardless of split size.
+`tests/test_eval_memory.py` guards this property: it asserts that an 8-image
+eval run stays below 2x the peak RSS of a 2-image run.
+
 ## Sanity checks and what to expect on synthetic data
 
 - **Synthetic task is trivially learnable**: after a short CPU training

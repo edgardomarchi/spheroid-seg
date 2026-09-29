@@ -6,10 +6,17 @@ import argparse
 import csv
 import datetime
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+# Cap glibc malloc arenas (default: 8 x ncores) so the streaming loop reuses
+# freed blocks across images instead of growing the resident set by roughly
+# one image's worth of allocator churn per iteration (measured at ~0.8 GB per
+# 50 MP image on a 16-core machine). Must be set before threads allocate.
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 import flax.serialization
 import jax
@@ -23,9 +30,12 @@ from spheroid_seg.data.metadata import parse_magnification
 from spheroid_seg.data.splits import load_split_list
 from spheroid_seg.data.synthetic import generate_synthetic_dataset, synthetic_split_names
 from spheroid_seg.data.tiling import extract_tiles, reassemble_from_tiles
-from spheroid_seg.metrics import dice_score, iou_score
 from spheroid_seg.models.unet import UNet
-from spheroid_seg.overlays import build_overlay_grid, select_overlay_samples
+from spheroid_seg.overlays import (
+    assemble_overlay_grid,
+    build_overlay_panels,
+    select_overlay_samples,
+)
 
 CLASS_NAMES = ["background", "loose cell", "aggregate"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
@@ -108,19 +118,22 @@ def _find_file_with_stem(directory: Path, stem: str) -> Path | None:
     return None
 
 
-def _load_split_samples(
+def _resolve_split_entries(
     config: dict[str, Any],
     split: str,
     tmp_dir: Path,
-) -> list[tuple[np.ndarray, np.ndarray, str]]:
-    """Load all (image, mask, name) tuples for the requested split."""
+) -> list[tuple[Path, Path, str]]:
+    """Resolve (raw_path, mask_path, name) triples for the requested split.
+
+    Only paths are resolved here; pixel data is streamed one image at a time by
+    :func:`evaluate_split` so peak memory stays bounded by a single image
+    regardless of how many images the split contains.
+    """
     raw_dir = Path(config["data"]["raw_dir"])
     masks_dir = Path(config["data"]["masks_dir"])
     splits_dir = Path(config["data"]["splits_dir"])
 
-    input_channels = config["input_channels"]
-    class_mapping = config["class_mapping"]
-    samples: list[tuple[np.ndarray, np.ndarray, str]] = []
+    entries: list[tuple[Path, Path, str]] = []
 
     if has_real_pairs(raw_dir, masks_dir):
         names = load_split_list(splits_dir, split)
@@ -131,14 +144,8 @@ def _load_split_samples(
                 raise FileNotFoundError(f"Image '{name}' from {split}.txt not found in {raw_dir}")
             if mask_path is None:
                 raise FileNotFoundError(f"Mask '{name}' from {split}.txt not found in {masks_dir}")
-            image, mask = load_pair(
-                raw_path,
-                mask_path,
-                input_channels=input_channels,
-                class_mapping=class_mapping,
-            )
-            samples.append((image, mask, name))
-        return samples
+            entries.append((raw_path, mask_path, name))
+        return entries
 
     # Synthetic fallback: generate the same dataset training uses and apply the
     # deterministic image-level split.
@@ -157,16 +164,9 @@ def _load_split_samples(
     for path in sorted(synth_raw.iterdir()):
         if path.suffix.lower() != ".png" or path.stem not in split_names:
             continue
-        mask_path = synth_masks / path.name
-        image, mask = load_pair(
-            path,
-            mask_path,
-            input_channels=input_channels,
-            class_mapping=class_mapping,
-        )
-        samples.append((image, mask, path.stem))
+        entries.append((path, synth_masks / path.name, path.stem))
 
-    return samples
+    return entries
 
 
 def _predict_full_image(
@@ -277,6 +277,34 @@ def object_metrics_from_3x3(
     return {"dice": pooled["dice"][1], "iou": pooled["iou"][1]}
 
 
+def _dice_iou_from_confusion(
+    confusion: np.ndarray,
+    *,
+    epsilon: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-class Dice and IoU derived from a confusion matrix.
+
+    Bit-identical to :func:`spheroid_seg.metrics.dice_score` and
+    :func:`spheroid_seg.metrics.iou_score` on the same pixels: the underlying
+    counts (intersection, prediction area, target area) are exact uint32
+    integers either way, and the closing float32 expressions are the same.
+    Deriving them from the already-materialized per-image confusion avoids
+    building full-image one-hot arrays (~1.5 GB of transient buffers per
+    50 MP image).
+    """
+    confusion = jnp.asarray(confusion)
+    tp = jnp.diag(confusion)
+    prediction_area = jnp.sum(confusion, axis=0)
+    target_area = jnp.sum(confusion, axis=1)
+    dice = (2.0 * tp + epsilon) / (prediction_area + target_area + epsilon)
+    iou = (tp + epsilon) / (prediction_area + target_area - tp + epsilon)
+    absent = (prediction_area == 0) & (target_area == 0)
+    return (
+        np.asarray(jnp.where(absent, 1.0, dice)),
+        np.asarray(jnp.where(absent, 1.0, iou)),
+    )
+
+
 def group_by_magnification(
     names: list[str],
     values: list[Any],
@@ -289,108 +317,20 @@ def group_by_magnification(
     return groups
 
 
-def _compute_metrics(
-    samples: list[tuple[np.ndarray, np.ndarray, str]],
-    predictions: list[np.ndarray],
-    num_classes: int,
-) -> dict[str, Any]:
-    """Compute overall, per-magnification, and per-image metrics."""
-    names = [name for _, _, name in samples]
-    masks = [mask for _, mask, _ in samples]
-
-    all_pred = jnp.concatenate([jnp.asarray(p).ravel() for p in predictions])
-    all_target = jnp.concatenate([jnp.asarray(m).ravel() for m in masks])
-    global_confusion = accumulate_confusion_matrix(all_pred, all_target, num_classes)
-    overall = class_metrics_from_confusion(global_confusion)
-    overall_object = object_metrics_from_3x3(global_confusion)
-
-    per_image: list[dict[str, Any]] = []
-    for (_, mask, name), pred in zip(samples, predictions, strict=False):
-        conf = accumulate_confusion_matrix(pred, mask, num_classes)
-        pooled = class_metrics_from_confusion(conf)
-        obj = object_metrics_from_3x3(conf)
-        per_image.append(
-            {
-                "name": name,
-                "magnification": parse_magnification(name),
-                "dice": np.asarray(pooled["dice"]).tolist(),
-                "iou": np.asarray(pooled["iou"]).tolist(),
-                "object_dice": float(obj["dice"]),
-                "object_iou": float(obj["iou"]),
-            }
-        )
-
-    grouped_preds = group_by_magnification(names, predictions)
-    grouped_masks = group_by_magnification(names, masks)
-
-    per_magnification: dict[str, Any] = {}
-    for mag in sorted(grouped_preds.keys()):
-        group_pred = jnp.concatenate([jnp.asarray(p).ravel() for p in grouped_preds[mag]])
-        group_target = jnp.concatenate([jnp.asarray(m).ravel() for m in grouped_masks[mag]])
-        conf = accumulate_confusion_matrix(group_pred, group_target, num_classes)
-        pooled = class_metrics_from_confusion(conf)
-        obj = object_metrics_from_3x3(conf)
-
-        group_dices = [
-            np.asarray(dice_score(p, m, num_classes))
-            for p, m in zip(grouped_preds[mag], grouped_masks[mag], strict=False)
-        ]
-        group_ious = [
-            np.asarray(iou_score(p, m, num_classes))
-            for p, m in zip(grouped_preds[mag], grouped_masks[mag], strict=False)
-        ]
-        group_object_dices = []
-        group_object_ious = []
-        for p, m in zip(grouped_preds[mag], grouped_masks[mag], strict=False):
-            im_conf = accumulate_confusion_matrix(p, m, num_classes)
-            im_obj = object_metrics_from_3x3(im_conf)
-            group_object_dices.append(float(im_obj["dice"]))
-            group_object_ious.append(float(im_obj["iou"]))
-
-        per_magnification[mag] = {
-            "dice": np.asarray(pooled["dice"]).tolist(),
-            "iou": np.asarray(pooled["iou"]).tolist(),
-            "object_dice": float(obj["dice"]),
-            "object_iou": float(obj["iou"]),
-            "per_image": {
-                "mean_dice": np.mean(group_dices, axis=0).tolist(),
-                "std_dice": np.std(group_dices, axis=0).tolist(),
-                "mean_iou": np.mean(group_ious, axis=0).tolist(),
-                "std_iou": np.std(group_ious, axis=0).tolist(),
-                "mean_object_dice": float(np.mean(group_object_dices)),
-                "std_object_dice": float(np.std(group_object_dices)),
-                "mean_object_iou": float(np.mean(group_object_ious)),
-                "std_object_iou": float(np.std(group_object_ious)),
-            },
-            "n_images": len(grouped_preds[mag]),
-        }
-
-    return {
-        "overall": {
-            "dice": np.asarray(overall["dice"]).tolist(),
-            "iou": np.asarray(overall["iou"]).tolist(),
-            "object_dice": float(overall_object["dice"]),
-            "object_iou": float(overall_object["iou"]),
-        },
-        "per_magnification": per_magnification,
-        "per_image": per_image,
-        "confusion_matrix": np.asarray(global_confusion).tolist(),
-        "confusion_matrix_object": np.asarray(object_confusion_from_3x3(global_confusion)).tolist(),
-        "class_names": CLASS_NAMES,
-    }
-
-
 def _write_outputs(
     output_dir: Path,
     metrics: dict[str, Any],
-    samples: list[tuple[np.ndarray, np.ndarray, str]],
-    predictions: list[np.ndarray],
+    overlay_samples: list[dict[str, Any]],
+    n_images: int,
     config: dict[str, Any],
 ) -> None:
     """Write metrics.json, metrics.csv, confusion matrices, and overlay grid.
 
     Writes the original 3x3 ``confusion_matrix.csv`` plus an optional
     ``confusion_matrix_object.csv`` (2x2 virtual bg/object) derived from it.
+    ``overlay_samples`` carries pixel data only for the images selected as
+    overlay panels, pre-rendered at panel width; selection is re-applied here
+    to fix the row order.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -407,7 +347,7 @@ def _write_outputs(
                     class_name,
                     metrics["overall"]["dice"][idx],
                     metrics["overall"]["iou"][idx],
-                    len(samples),
+                    n_images,
                 ]
             )
         writer.writerow(
@@ -416,7 +356,7 @@ def _write_outputs(
                 "object",
                 metrics["overall"]["object_dice"],
                 metrics["overall"]["object_iou"],
-                len(samples),
+                n_images,
             ]
         )
         for mag, group in metrics["per_magnification"].items():
@@ -457,21 +397,11 @@ def _write_outputs(
     num_overlay_samples = eval_config.get("num_overlay_samples", 8)
     panel_width = eval_config.get("overlay_panel_width", 384)
 
-    overlay_samples = [
-        {
-            "name": name,
-            "magnification": parse_magnification(name),
-            "raw": _float_image_to_uint8(image),
-            "gt": mask.astype(np.uint8),
-            "pred": pred.astype(np.uint8),
-        }
-        for (_, mask, name), pred, (image, _, _) in zip(samples, predictions, samples, strict=False)
-    ]
     selected = select_overlay_samples(overlay_samples, num_overlay_samples)
     if selected:
         import cv2
 
-        grid = build_overlay_grid(selected, panel_width)
+        grid = assemble_overlay_grid(selected, panel_width)
         cv2.imwrite(str(output_dir / "overlays_grid.png"), grid)
 
 
@@ -527,6 +457,13 @@ def evaluate_split(
 ) -> tuple[Path, dict[str, Any]]:
     """Run evaluation for a split and write all outputs.
 
+    Images are streamed one at a time (load -> predict -> accumulate ->
+    release); across images only small aggregated state is retained: pooled
+    confusion counts, per-image scalar metrics, and the panel-resolution
+    overlay renderings of the few images selected for the grid. Peak memory
+    therefore stays bounded by one image plus a constant overlay budget,
+    independent of split size.
+
     Outputs are written to a unique ``outputs/evals/<config>_<timestamp>/``
     directory: ``metrics.json``, ``metrics.csv``, ``confusion_matrix.csv``,
     ``confusion_matrix_object.csv``, and ``overlays_grid.png``.
@@ -537,15 +474,48 @@ def evaluate_split(
     model, ckpt = load_model_and_checkpoint(config, checkpoint_path)
     predict_fn = _make_predict_fn(model.apply)
 
+    num_classes = config["num_classes"]
+    eval_config = config.get("eval", {})
+    eval_batch_size = eval_config.get("batch_size", config["batch_size"])
+    num_overlay_samples = eval_config.get("num_overlay_samples", 8)
+    panel_width = eval_config.get("overlay_panel_width", 384)
+
     with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        samples = _load_split_samples(config, split, tmp_dir)
-        if not samples:
+        entries = _resolve_split_entries(config, split, Path(tmp))
+        if not entries:
             raise ValueError(f"No images found for split '{split}'.")
 
-        predictions: list[np.ndarray] = []
-        eval_batch_size = config.get("eval", {}).get("batch_size", config["batch_size"])
-        for image, _, _ in samples:
+        # Overlay selection is a pure function of (name, magnification), so
+        # decide it on lightweight metadata and keep pixel data only for the
+        # images that will actually be rendered in the grid.
+        names = [name for _, _, name in entries]
+        mags = [parse_magnification(name) for name in names]
+        selected_names = {
+            sample["name"]
+            for sample in select_overlay_samples(
+                [{"name": n, "magnification": m} for n, m in zip(names, mags, strict=True)],
+                num_overlay_samples,
+            )
+        }
+
+        global_confusion = np.zeros((num_classes, num_classes), dtype=np.uint32)
+        group_confusions: dict[str, np.ndarray] = {}
+        group_dices: dict[str, list[np.ndarray]] = {}
+        group_ious: dict[str, list[np.ndarray]] = {}
+        group_object_dices: dict[str, list[float]] = {}
+        group_object_ious: dict[str, list[float]] = {}
+        per_image: list[dict[str, Any]] = []
+        overlay_samples: list[dict[str, Any]] = []
+
+        input_channels = config["input_channels"]
+        class_mapping = config["class_mapping"]
+        for raw_path, mask_path, name in entries:
+            image, mask = load_pair(
+                raw_path,
+                mask_path,
+                input_channels=input_channels,
+                class_mapping=class_mapping,
+            )
             pred = _predict_full_image(
                 predict_fn,
                 ckpt["params"],
@@ -554,11 +524,92 @@ def evaluate_split(
                 tile_size=config["patch_size"],
                 batch_size=eval_batch_size,
             )
-            predictions.append(np.asarray(pred))
 
-        metrics = _compute_metrics(samples, predictions, config["num_classes"])
+            # Per-image confusion first; every pooled matrix below is the exact
+            # integer sum of per-image matrices (uint32 accumulation, as
+            # documented in accumulate_confusion_matrix).
+            conf = np.asarray(accumulate_confusion_matrix(pred, mask, num_classes))
+            pooled = class_metrics_from_confusion(conf)
+            obj = object_metrics_from_3x3(conf)
+            mag = parse_magnification(name)
+
+            global_confusion += conf
+            group_confusions[mag] = group_confusions.get(mag, np.zeros_like(conf)) + conf
+            dice, iou = _dice_iou_from_confusion(conf)
+            group_dices.setdefault(mag, []).append(dice)
+            group_ious.setdefault(mag, []).append(iou)
+            group_object_dices.setdefault(mag, []).append(float(obj["dice"]))
+            group_object_ious.setdefault(mag, []).append(float(obj["iou"]))
+            per_image.append(
+                {
+                    "name": name,
+                    "magnification": mag,
+                    "dice": np.asarray(pooled["dice"]).tolist(),
+                    "iou": np.asarray(pooled["iou"]).tolist(),
+                    "object_dice": float(obj["dice"]),
+                    "object_iou": float(obj["iou"]),
+                }
+            )
+            if name in selected_names:
+                # Render the small grid panels now, while the full-resolution
+                # arrays are still in memory; only the resized panels are kept.
+                overlay_sample = {
+                    "raw": _float_image_to_uint8(image),
+                    "gt": mask.astype(np.uint8),
+                    "pred": pred.astype(np.uint8),
+                }
+                overlay_samples.append(
+                    {
+                        "name": name,
+                        "magnification": mag,
+                        "panels": build_overlay_panels(overlay_sample, panel_width),
+                    }
+                )
+
+        overall = class_metrics_from_confusion(global_confusion)
+        overall_object = object_metrics_from_3x3(global_confusion)
+
+        per_magnification: dict[str, Any] = {}
+        for mag in sorted(group_confusions.keys()):
+            conf = group_confusions[mag]
+            pooled = class_metrics_from_confusion(conf)
+            obj = object_metrics_from_3x3(conf)
+            per_magnification[mag] = {
+                "dice": np.asarray(pooled["dice"]).tolist(),
+                "iou": np.asarray(pooled["iou"]).tolist(),
+                "object_dice": float(obj["dice"]),
+                "object_iou": float(obj["iou"]),
+                "per_image": {
+                    "mean_dice": np.mean(group_dices[mag], axis=0).tolist(),
+                    "std_dice": np.std(group_dices[mag], axis=0).tolist(),
+                    "mean_iou": np.mean(group_ious[mag], axis=0).tolist(),
+                    "std_iou": np.std(group_ious[mag], axis=0).tolist(),
+                    "mean_object_dice": float(np.mean(group_object_dices[mag])),
+                    "std_object_dice": float(np.std(group_object_dices[mag])),
+                    "mean_object_iou": float(np.mean(group_object_ious[mag])),
+                    "std_object_iou": float(np.std(group_object_ious[mag])),
+                },
+                "n_images": len(group_dices[mag]),
+            }
+
+        metrics = {
+            "overall": {
+                "dice": np.asarray(overall["dice"]).tolist(),
+                "iou": np.asarray(overall["iou"]).tolist(),
+                "object_dice": float(overall_object["dice"]),
+                "object_iou": float(overall_object["iou"]),
+            },
+            "per_magnification": per_magnification,
+            "per_image": per_image,
+            "confusion_matrix": global_confusion.tolist(),
+            "confusion_matrix_object": np.asarray(
+                object_confusion_from_3x3(global_confusion)
+            ).tolist(),
+            "class_names": CLASS_NAMES,
+        }
+
         output_dir = _make_output_dir(config, config_path)
-        _write_outputs(output_dir, metrics, samples, predictions, config)
+        _write_outputs(output_dir, metrics, overlay_samples, len(entries), config)
         _print_summary(metrics)
 
     return output_dir, metrics

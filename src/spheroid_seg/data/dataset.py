@@ -101,12 +101,32 @@ def normalize_percentile(image: np.ndarray, low: int = 1, high: int = 99) -> np.
     Returns:
         Float32 array in [0, 1] with same channel layout as input.
     """
-    image = image.astype(np.float32)
+    # Percentiles are computed on the input array: for integer dtypes and
+    # float16/float32 the values are exactly representable in float64, so the
+    # result is identical to computing them on a float32 copy but with a much
+    # smaller partition buffer. Wider float dtypes are cast first to preserve
+    # the original rounding behavior exactly.
+    if image.dtype.kind == "f" and image.dtype.itemsize > 4:
+        image = image.astype(np.float32)
     p_low, p_high = np.percentile(image, [low, high])
+    image = np.ascontiguousarray(image)
     if p_high <= p_low:
-        return np.zeros_like(image, dtype=np.float32)
-    clipped = np.clip(image, p_low, p_high)
-    return ((clipped - p_low) / (p_high - p_low)).astype(np.float32)
+        return np.zeros(image.shape, dtype=np.float32)
+    # The percentile scalars are float64, so clip/subtract/divide promote to
+    # float64 before the final cast — replicate that pipeline exactly, but
+    # chunk-cast the input so no full-size float32 copy is materialized: these
+    # ops are elementwise, so chunking preserves values bit for bit while
+    # keeping peak memory bounded on large images.
+    denominator = p_high - p_low
+    out = np.empty(image.shape, dtype=np.float32)
+    flat_in = image.reshape(-1)
+    flat_out = out.reshape(-1)
+    chunk = 1 << 22  # ~32 MB of float64 temporaries per block
+    for start in range(0, flat_in.size, chunk):
+        end = min(start + chunk, flat_in.size)
+        clipped = np.clip(flat_in[start:end].astype(np.float32), p_low, p_high)
+        flat_out[start:end] = ((clipped - p_low) / denominator).astype(np.float32)
+    return out
 
 
 def remap_classes(mask: np.ndarray, mapping: dict[int, int]) -> np.ndarray:
