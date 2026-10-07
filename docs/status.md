@@ -4,7 +4,8 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-09-29 (eval now reports proper scoring rules — per-class Brier and log loss — alongside Dice/IoU).
+Last updated: 2026-10-01 (validation diagnostics command added; stale `train.py`
+resume item removed — resume is documented in `docs/training.md`).
 
 ## Modules
 
@@ -20,6 +21,7 @@ Last updated: 2026-09-29 (eval now reports proper scoring rules — per-class Br
 | CI — GitHub Actions | Done | lint + `pytest` matrix on Python 3.12/3.13/3.14; see `.github/workflows/ci.yml` |
 | M6 — Post-processing (v0.2) | Pending | instances, morphometrics, hybrid spheroid/organoid classification |
 | M7 — SLiMIA pre-training | Deferred | domain-shift risk; only if own data underperforms |
+| Validation diagnostics | Done | `python -m spheroid_seg.validation_diagnostics`: class prevalence (full-image + saved patches), FP connected components, post-hoc background-logit-bias sweep; read-only, streaming, CPU-safe; see `docs/evaluation.md` §Validation diagnostics |
 
 ## First real-data baseline
 
@@ -88,6 +90,40 @@ pixels of one class. All numbers above are post-fix (verified run:
   as object).
 - False-negative patches inside objects match the loose↔aggregate confusion seen
   in the matrix.
+
+### 96-image training run (2026-09-30) and diagnostics context
+
+The full first clinical batch (96 annotated images) trained as
+`outputs/runs/colab_drive_20260930_120108` (`configs/colab.yaml` on Colab):
+splits train 68 / val 15 / test 13, 1,088 train + 240 val patches
+(`patches_per_image: 16`). Checkpoint selection and early stopping follow
+`val_dice_pooled_mean`; best epoch 79 (`val_dice_pooled_mean = 0.709395`),
+early stopping after epoch 99. The full-image validation eval used
+`checkpoints/best_checkpoint.msgpack` (see the most recent
+`outputs/evals/base_*/` report).
+
+Headline validation pathology: object recall is high (0.94) but object
+precision is low (0.42) — the model predicts ~2.3x more object pixels than
+the ground truth contains — and proper scores show the probabilities
+over-forecast foreground. To explain this before changing anything, the
+2026-10-01 validation diagnostics command (`docs/evaluation.md`
+§Validation diagnostics) was run on the full validation split; its
+authoritative outputs live under
+`outputs/diagnostics/base_20261001_151953/` (acceptance-verified against
+`outputs/evals/base_20261001_120619/`: bias-0 confusion and proper scores
+reproduce the eval exactly; component areas sum exactly to the
+confusion-derived false-positive counts). Headline findings: median
+false-positive component is 3 px, but components < 256 px carry only ~3% of
+the FP area — the overprediction is broad regions and border-associated
+components (~23% of FP area touches the image border), not small speckles;
+raising the background logit monotonically trades recall for precision
+(object Dice peaks near the largest grid bias, δ = 2). No training, tuning,
+or test-split evaluation was performed.
+
+Note: this run's downloaded checkpoint set has no
+`checkpoints/training_patches.npz`, so the saved-patch prevalence analysis
+was skipped there (explicitly flagged by the command); full-image prevalence
+is unaffected. The test split remains untouched.
 
 ## Decisions made after the design doc
 
@@ -182,12 +218,14 @@ pixels of one class. All numbers above are post-fix (verified run:
 
 ## Pending — technical
 
-- **`train.py` resume-from-checkpoint** (design doc §5): training must be
-  resumable because cloud sessions can be cut, but `train.py` only saves
-  checkpoints and has no `--resume` path.
+- ~~**`train.py` resume-from-checkpoint**~~ Done — resume support is documented in
+  `docs/training.md` (§Resuming training, checkpoint schema, config-mismatch
+  policy, log continuity).
 - **Speckle false positives (4x) and dark-well-rim false positives** observed in
   baseline overlays: a minimum-object-size filter and possible border handling
-  are v0.2 post-processing scope; no action in v0.1.
+  are v0.2 post-processing scope; no action in v0.1. The 2026-10-01 validation
+  diagnostics quantify the false positives (component sizes, border association)
+  before any such decision — see `docs/evaluation.md` §Validation diagnostics.
 
 ## Pending — clinical group
 

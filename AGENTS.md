@@ -25,6 +25,7 @@ holds stable conventions and commands; do not duplicate design content here.
 - CI: on every push/PR to `main`, GitHub Actions runs `ruff check`, `ruff format --check`, and `pytest` across Python 3.12/3.13/3.14.
 - Train: `uv run python -m spheroid_seg.train --config configs/base.yaml`
 - Eval: `uv run python -m spheroid_seg.eval --config configs/base.yaml`
+- Diagnostics: `uv run python -m spheroid_seg.validation_diagnostics --config configs/base.yaml --run-dir outputs/runs/<run>` (read-only; see `docs/evaluation.md` §Validation diagnostics)
 
 ## Conventions
 
