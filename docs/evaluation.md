@@ -192,6 +192,123 @@ class rows, the `object` row, and the `all` row. `metrics.json` gains `brier`,
 `brier_all`, `log_loss`, and `log_loss_all` under `overall` and each
 `per_magnification` entry.
 
+## Validation diagnostics
+
+`src/spheroid_seg/validation_diagnostics.py` adds a read-only diagnostics
+command that explains the current model's foreground overprediction before
+any training change is considered. It analyzes a selected split (normally
+`val`) in a single streaming pass and never trains, resumes, or touches the
+test split:
+
+```bash
+uv run python -m spheroid_seg.validation_diagnostics \
+    --config configs/base.yaml \
+    --run-dir outputs/runs/colab_drive_20260930_120108 \
+    --split val \
+    --background-bias-grid 0,0.25,0.5,0.75,1,1.5,2 \
+    --area-thresholds 16,64,256,1024,4096
+```
+
+Options: `--config`, `--split` (`val`/`test`), `--run-dir`/`--checkpoint`
+(same resolution as eval), `--background-bias-grid` (comma-separated,
+default `0,0.25,0.5,0.75,1,1.5,2`), `--area-thresholds` (comma-separated
+pixels, default `16,64,256,1024,4096`), `--output-root` (default
+`outputs/diagnostics/`), `--skip-saved-patch-prevalence`, and `--max-images`
+(smoke/debug only — never use it for a real-data acceptance run). Every
+invocation writes to a unique `outputs/diagnostics/<config>_<timestamp>/`
+directory and never overwrites an existing non-empty one.
+
+### Part 1 — class prevalence
+
+Exact class-pixel counts (uint64) for the full-image train/val masks listed
+in `data/splits/{train,val}.txt` and for the exact saved augmented patches
+in `<run-dir>/checkpoints/training_patches.npz` (the NPZ schema written by
+`train.py::save_training_state` is validated first: a missing file or an
+uninterpretable schema fails with a clear error — a different patch set is
+never silently reconstructed; use `--skip-saved-patch-prevalence` to analyze
+full images only, which the summary records). Original mask IDs 2 and 3 are
+counted together as model class 2 via the config's `class_mapping`. Full
+images are processed one at a time; NPZ arrays one at a time and released.
+
+`patch_prevalence.csv` — long format `source,split,class_name,pixel_count,
+pixel_fraction` with `source` ∈ `full_image`/`saved_patch`; `summary.md`
+adds foreground/loose/aggregate fractions per source/split and the ratio
+between saved-patch and full-image foreground prevalence.
+
+### Part 2 — false-positive connected components
+
+For the baseline bias 0, the reassembled full-image argmax prediction (the
+same tiling/reassembly as eval) is decomposed with 8-connectivity
+(`scipy.ndimage.label`) into connected components, per analysis mask:
+
+- `object`: predicted foreground (class 1 or 2) where ground truth is
+  background;
+- `loose cell`: predicted class 1 where ground truth is not class 1;
+- `aggregate`: predicted class 2 where ground truth is not class 2.
+
+For every component, `fp_components.csv` records image, magnification,
+analysis mask, component ID, area (px), inclusive bounding box, centroid,
+minimum distance to the image border, whether it touches the border, and
+the mean/median normalized image intensity inside the component.
+`fp_component_summary.csv` groups by image/magnification/analysis mask with
+total FP area, component count, mean/median/max area, area (and fraction)
+below each configured threshold, and border-touching area (and fraction).
+Acceptance invariant: component areas sum exactly to the false-positive
+pixel count derived from the image's confusion counts.
+
+### Part 3 — background-logit-bias sweep
+
+A post-hoc calibration probe: for a grid of biases `delta`, the background
+logit is raised by `delta` and the metrics are recomputed without
+retraining. The prediction function exposes softmax probabilities, so the
+bias is applied as the mathematically equivalent log-probability shift
+`softmax(log p + delta * one_hot(background))`; boosting the background can
+only move argmax decisions toward background, so the predicted foreground
+count is monotonically non-increasing in `delta`, and a sufficiently large
+bias predicts background wherever the float32 background probability did not
+underflow to exactly 0 (underflowed pixels follow exact softmax semantics
+and can never flip). At `delta == 0` the raw probabilities are used with no
+transform.
+
+Each tile is predicted once and every grid accumulator is updated from that
+tile. Per bias value and group (`overall` plus magnification groups) the
+sweep accumulates the pooled 3x3 confusion matrix (exact uint32) and the
+float64 proper-score partial sums, then reports in `bias_sweep.csv` (long
+format): `background_bias,group,class,dice,iou,precision,recall,brier,
+log_loss,gt_pixels,pred_pixels,n_images` — one row per model class, plus an
+`object` row (Dice/IoU/precision/recall derived from the 3x3 matrix with
+the semantics of §Combined "object" metric; proper scores empty because the
+object class is a post-hoc merge, not a softmax output) and an `all` row
+(multiclass Brier + overall log loss). Per-class precision is TP/column
+sum, recall TP/row sum, NaN when the denominator is zero. Reflect-padded
+tile pixels are excluded from every count and proper score. A companion
+`bias_sweep_confusion.csv` (`background_bias,group,gt,prediction,count`)
+makes the per-bias confusion matrices directly inspectable.
+
+Acceptance invariants (tested in `tests/test_validation_diagnostics*.py`):
+
+1. bias `0` reproduces the existing eval's pooled confusion matrix exactly;
+2. bias `0` reproduces the eval proper scores exactly — proper sums are
+   staged per image and folded once per image, the same nesting as the eval
+   path (only the summation order tolerance would apply otherwise);
+3. predicted foreground pixels are monotonic non-increasing in the bias;
+4. a sufficiently large positive bias predicts background everywhere
+   (modulo the float32 exact-zero corner documented above);
+5. object metrics derive from the 3x3 matrix with the documented
+   semantics.
+
+### Memory and streaming guarantees
+
+The diagnostics loop streams like eval: one image is loaded, tiled, and
+predicted once; per-tile probabilities feed all bias accumulators and the
+baseline reassembly, then are released. Across images only small aggregated
+state survives (uint32 confusion counts, float64 proper-score partial sums,
+per-component scalar rows) — per-image probability maps are never retained.
+Part 1 reads one mask or one NPZ array at a time. Peak RSS therefore stays
+bounded by one image plus a constant accumulator budget regardless of split
+size; `tests/test_validation_diagnostics_memory.py` guards this the same way
+as the eval memory test (8-image peak RSS < 2x the 2-image peak).
+
 ## Known limitations
 
 - Tiling is currently non-overlapping; overlapping patches with logit averaging
