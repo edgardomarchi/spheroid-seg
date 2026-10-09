@@ -16,6 +16,9 @@ configs/*.yaml ──► train.py ──► dataset + patching + augment (data p
                      ▼
         outputs/runs/<config>_<timestamp>/
             ├── logs/train_log.csv      per-epoch losses and Dice (macro + pooled)
+            ├── logs/patch_class_prevalence.csv
+            │                           exact class-pixel/patch prevalence of the
+            │                           post-augmentation train/val patch set
             └── checkpoints/            best-by-pooled-val-Dice kept
 ```
 
@@ -69,6 +72,52 @@ before then is macro-based and is converted on resume (see *Log continuity*
 below). Historical patch-val numbers from those runs are inflated for rare
 classes.
 
+## Patch class prevalence logging
+
+Every fresh run writes `logs/patch_class_prevalence.csv` right after the
+train/validation patches are built. The counts describe the **exact
+post-augmentation patch arrays the training loop consumes** — they are
+computed from the same in-memory arrays (read-only, via `numpy.bincount`,
+one patch at a time), not from a separate reconstruction pass with a
+different random stream. The pass consumes no randomness, so it cannot
+alter RNG consumption, patch order, augmentation, batching, losses, or
+checkpointing. A concise summary is also printed to stdout:
+
+```text
+Patch class prevalence:
+  train: foreground=0.1234 loose=0.0567 aggregate=0.0667 object patches=820/1088
+  val:   foreground=0.4567 loose=0.1111 aggregate=0.2222 object patches=190/240
+```
+
+The CSV is long format with one row per split (`train`/`val`), per model
+class (`background`/`loose cell`/`aggregate`), plus an `object` row:
+
+| Column | Definition |
+|---|---|
+| `split` | `train` or `val` |
+| `class_name` | `background`, `loose cell`, `aggregate`, or `object` |
+| `pixel_count` | exact uint64 class-pixel count |
+| `pixel_fraction` | `pixel_count` relative to all pixels of that split's patch set |
+| `patches_with_class_count` | patches containing at least one pixel of that class |
+| `patches_with_class_fraction` | that count relative to the split's `n_patches` |
+| `n_patches` | number of patches in the split |
+| `total_pixels` | `n_patches * patch_size**2` |
+
+The `object` row is the **union** of the two foreground classes (loose cell ∪
+aggregate): its `pixel_count` is the sum of the two class pixel counts,
+while its `patches_with_class_count` counts each patch at most once (a patch
+containing both classes counts once). Classes absent from every patch keep a
+zero-count row — they are never omitted.
+
+The file is written for fresh runs only. On resume the existing file is
+preserved untouched (the resumed run reads the same patches from
+`checkpoints/training_patches.npz`, so recomputation could not add
+information); a write failure aborts the run loudly rather than training
+without the diagnostic. The `training_patches.npz` checkpoint artifact is
+unchanged by this logging. Counting logic lives in
+`src/spheroid_seg/patch_prevalence.py`; `tests/test_patch_prevalence.py`
+verifies the exact counts against the run's saved patch arrays.
+
 ## Configurations
 
 | Config | Patch | Base features | BN momentum | Purpose |
@@ -78,7 +127,20 @@ classes.
 | `configs/base.yaml` | 512 | 32 | 0.9 | full model (7.7M params); intended for GPU |
 
 All tests and smoke checks must pass on CPU-only machines; `base.yaml`
-training is expected to run on GPU or Colab.
+training is expected to run on GPU or Colab. `configs/colab.yaml` is the
+same model as `base.yaml` with `batch_size: 4` for free-tier Colab T4 GPUs
+(see *Cloud GPU (Colab)* below).
+
+Experiment configs are mechanical copies of `configs/colab.yaml` with
+exactly one intentional difference, kept for controlled comparisons:
+
+- `configs/colab_bgweight05.yaml` — background class weight raised from 0.1
+  to 0.5 (`class_weights: [0.5, 1.0, 1.0]`), everything else identical to
+  `configs/colab.yaml` (including `object_patch_ratio`). Purpose: the
+  96-image run (`colab_drive_20260930_120108`) shows broad foreground
+  overprediction and a post-hoc background-logit-bias optimum near δ = 2.0,
+  so the next controlled experiment increases only the background CE weight
+  (see `docs/status.md`).
 
 ## Usage
 

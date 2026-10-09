@@ -4,8 +4,9 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-10-01 (validation diagnostics command added; stale `train.py`
-resume item removed — resume is documented in `docs/training.md`).
+Last updated: 2026-10-08 (next controlled experiment prepared: background CE
+weight 0.5 via `configs/colab_bgweight05.yaml`; per-run patch class-prevalence
+logging added to `train.py`).
 
 ## Modules
 
@@ -22,6 +23,7 @@ resume item removed — resume is documented in `docs/training.md`).
 | M6 — Post-processing (v0.2) | Pending | instances, morphometrics, hybrid spheroid/organoid classification |
 | M7 — SLiMIA pre-training | Deferred | domain-shift risk; only if own data underperforms |
 | Validation diagnostics | Done | `python -m spheroid_seg.validation_diagnostics`: class prevalence (full-image + saved patches), FP connected components, post-hoc background-logit-bias sweep; read-only, streaming, CPU-safe; see `docs/evaluation.md` §Validation diagnostics |
+| Patch class-prevalence logging | Done | fresh `train.py` runs write `logs/patch_class_prevalence.csv` with exact post-augmentation train/val patch counts (uint64, `numpy.bincount`) plus an stdout summary; read-only, RNG-free; resume preserves the file; see `docs/training.md` §Patch class prevalence logging |
 
 ## First real-data baseline
 
@@ -124,6 +126,22 @@ Note: this run's downloaded checkpoint set has no
 `checkpoints/training_patches.npz`, so the saved-patch prevalence analysis
 was skipped there (explicitly flagged by the command); full-image prevalence
 is unaffected. The test split remains untouched.
+
+### Next controlled experiment — background CE weight 0.5
+
+The 96-image diagnostics show broad foreground overprediction (object
+recall 0.94 vs precision 0.42; ~2.3× more predicted than GT object pixels,
+in regions rather than speckles) and a post-hoc background-logit-bias sweep
+whose object-Dice optimum sits at the largest grid bias, δ ≈ 2.0 (object
+Dice 0.6647 vs 0.5760 at bias 0; δ = 2.5 already reduces class Dice). The
+next controlled experiment therefore raises only the background CE weight
+from 0.1 to 0.5 (`class_weights: [0.5, 1.0, 1.0]`) via
+`configs/colab_bgweight05.yaml` — an exact copy of `configs/colab.yaml`
+except `class_weights`; `object_patch_ratio` stays 0.8. Per-run patch
+class-prevalence logging (§Patch class-prevalence logging in
+`docs/training.md`) was added first so the exact train/val patch
+composition of this and future runs is auditable from
+`logs/patch_class_prevalence.csv`.
 
 ## Decisions made after the design doc
 

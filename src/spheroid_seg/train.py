@@ -28,6 +28,11 @@ from spheroid_seg.eval import CLASS_NAMES, accumulate_confusion_matrix, class_me
 from spheroid_seg.losses import segmentation_loss
 from spheroid_seg.metrics import dice_score
 from spheroid_seg.models.unet import UNet
+from spheroid_seg.patch_prevalence import (
+    PREVALENCE_CSV_NAME,
+    prevalence_summary,
+    write_prevalence_csv,
+)
 
 
 class TrainState(train_state.TrainState):
@@ -773,6 +778,18 @@ def train(
             print("Building validation patches...")
             val_images, val_masks = _build_patch_arrays(val_dataset, config, np_rng, augment=False)
             print(f"  {len(val_images)} validation patches.")
+
+            # Exact class-prevalence diagnostic for the post-augmentation patch
+            # arrays built above. Read-only counting that consumes no RNG; the
+            # CSV is written only for fresh runs — on resume the file from the
+            # original run is preserved untouched. Write errors propagate so a
+            # run never trains silently without this diagnostic.
+            prevalence_stats = write_prevalence_csv(
+                logs_dir / PREVALENCE_CSV_NAME,
+                {"train": train_masks, "val": val_masks},
+                config["num_classes"],
+            )
+            print(prevalence_summary(prevalence_stats, config["num_classes"]))
 
         steps_per_epoch = max(len(train_images) // config["batch_size"], 1)
         state = create_train_state(config, jax_rng, steps_per_epoch)
