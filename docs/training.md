@@ -244,43 +244,129 @@ Open the notebook directly:
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/edgardomarchi/spheroid-seg/blob/main/notebooks/colab_training.ipynb)
 
-What the notebook does, in order:
+The notebook is an **explicit experiment runner** with two supported uses:
 
-1. Detects whether a GPU is available (`nvidia-smi`) and clones the repo.
-2. Installs the package with pip in editable mode, adding the `viz` extra and,
-   on GPU runtimes, the `cuda12` JAX extra:
-   `pip install -e ".[cuda12,viz]"` (GPU) or `pip install -e ".[viz]"` (CPU).
-   The install cell skips if the package is already importable.
-3. Runs a fast post-install sanity check: import `spheroid_seg`, print the
-   package version, and `jax.devices()`.
-4. Optionally loads a private `data/` directory from Google Drive (see below);
-   by default this step is skipped and the synthetic fallback is used.
-5. Runs the pending M3 acceptance check:
-   `python -m spheroid_seg.train --config configs/base.yaml --overfit-one-batch`
-   on GPU only — loss should fall to near-zero. The subprocess sets
-   `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` to leave headroom for XLA.
-6. Runs a few epochs of full training with `configs/colab.yaml` (same model as
-   `base.yaml` but `batch_size: 4`) on the synthetic fallback to measure GPU
-   throughput. This subprocess also sets `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9`.
-7. Plots training curves from the run's CSV log.
-8. Zips the latest run under `outputs/runs/colab_*/` and downloads it, because
-   Colab sessions can be cut at any time.
+1. **Quickstart / smoke run** (the shipped defaults): verify the pipeline end to
+   end in a few minutes, including the GPU overfit-one-batch acceptance check.
+2. **Controlled experiment run**: select an experiment config and let the config
+   itself define the run length, with no notebook-level override of any kind.
+
+### Notebook flow
+
+The notebook is a chain of short, single-purpose sections:
+
+1. **Markdown overview** — the two supported uses and the controlled-experiment
+   settings.
+2. **User settings cell** — the only cell a user edits: git source, Drive
+   paths, `TRAIN_CONFIG`, `TRAIN_EPOCHS`, `RUN_OVERFIT_CHECK`, `FORCE_FRESH`,
+   `ALLOW_DIRTY_REPO`, `REPAIR_JAX_ENVIRONMENT`. Assignments only; no helpers,
+   no subprocess calls, no GPU probing, no derived values.
+3. **Runtime derivation and helper cell** — derives `REPO`, `HAS_GPU`,
+   `PIP_EXTRA`, `TRAIN_PREFIX`, the Drive throwaway config path, and defines the
+   streaming `run()` helper.
+4. **Resolved execution plan gate** — prints the exact plan (config, run
+   prefix, requested epochs, git ref, data source, pip extra, fresh-vs-resume)
+   **before any side effect**, and raises early on invalid settings (a
+   `TRAIN_CONFIG` not ending in `.yaml`; a `TRAIN_EPOCHS` that is neither
+   `None` nor a positive integer).
+5. **Repository synchronization** — clones if missing; otherwise verifies the
+   existing clone is a git repository, **refuses to update it when local
+   modifications exist** (unless `ALLOW_DIRTY_REPO = True`, which only warns),
+   fetches, and updates fast-forward-only. Prints the commit SHA and asserts
+   the selected config exists in the clone. A reused runtime can therefore
+   never silently train from stale source code.
+6. **Environment installation and JAX/CUDA repair** — never skips merely
+   because `spheroid_seg` is importable. Inspects installed distributions with
+   `importlib.metadata` before importing JAX; on GPU runtimes with
+   `REPAIR_JAX_ENVIRONMENT = True` removes CUDA plugin distributions from the
+   wrong family (e.g. `jax-cuda13-*` while the project uses the `cuda12`
+   extra) and reinstalls editable with `[cuda12,viz]` (GPU) or `[viz]` (CPU) so
+   pip realigns the JAX family with the project's dependency specification. If
+   JAX was already imported with incompatible plugins installed, the cell stops
+   and asks for a runtime restart.
+7. **Post-install JAX sanity gate** — prints `spheroid_seg.__version__`, the
+   JAX/JAXLIB/CUDA plugin versions, and `jax.devices()`; on GPU runtimes it
+   raises `RuntimeError` unless JAX itself reports a GPU device. **Do not trust
+   a long run — or start one — until this gate passes**; a CPU fallback is
+   acceptable only when `nvidia-smi` reported no GPU.
+8. **Optional Google Drive data cell** (see below).
+9. **Optional overfit-one-batch quickstart check** (see below).
+10. **Main training cell** — trains the resolved `TRAIN_CONFIG`. There is no
+    hidden experiment override: `TRAIN_EPOCHS = None` omits `--epochs` entirely
+    and the config decides the run length; an integer is passed explicitly as
+    `--epochs <value>`. The exact command is printed before launching. With a
+    verified Drive mount, checkpoints are written to Drive and only run
+    directories matching the selected config prefix are scanned for resume.
+    After training, the cell locates the run directory (raising loudly if none
+    matches the prefix) and prints the checkpoint, training-log, and
+    patch-prevalence paths.
+11. **Training curves and artifacts** — plots from the run directory located by
+    the training cell and lists artifact presence.
+12. **Checkpoint persistence** — prints the Drive path when outputs live on
+    Drive; otherwise zips the run and downloads it.
+
+### Controlled experiment settings
+
+For a controlled experiment, change only the settings cell. The current
+experiment (background CE weight 0.5) uses:
+
+```python
+TRAIN_CONFIG = "configs/colab_bgweight05.yaml"
+TRAIN_EPOCHS = None  # no notebook-level epoch override; the config decides
+RUN_OVERFIT_CHECK = False  # the quickstart check must not run before an experiment
+FORCE_FRESH = True  # never resume an unrelated Drive run
+```
+
+With these settings the main training cell produces a run directory named
+`colab_bgweight05_<timestamp>`. Notes:
+
+- `TRAIN_EPOCHS = None` means **no** notebook-level epoch override — the
+  trainer falls back to the config's own `epochs` value.
+- A `base_<timestamp>` run directory comes **only** from the optional
+  overfit-one-batch quickstart check (`configs/base.yaml`), never from the
+  controlled experiment. Set `RUN_OVERFIT_CHECK = False` for experiments so the
+  check can never be mistaken for the experiment run.
+- The exact resolved command line is printed before the training subprocess
+  launches; review it together with the resolved execution plan above.
+
+### Overfit-one-batch quickstart check
+
+Runs only when the runtime has a GPU **and** `RUN_OVERFIT_CHECK = True`; when
+skipped, the cell prints exactly why. It intentionally runs
+`python -m spheroid_seg.train --config configs/base.yaml --overfit-one-batch`
+and therefore creates a `base_<timestamp>` run directory — loss should fall
+monotonically to near-zero, showing the 512² / 7.7M-param model can memorize a
+single batch. The subprocess sets `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` to leave
+headroom for XLA.
 
 ### Optional Google Drive data loading
 
-For real-data training, set `USE_DRIVE_DATA = True` in the setup cell. The
-notebook will then mount Drive and copy `raw/`, `masks/`, and `splits/` from
+For real-data training, set `USE_DRIVE_DATA = True` in the settings cell. The
+notebook will then mount Drive and copy `raw/` and `masks/` from
 `DRIVE_DATA_DIR` (default: `/content/drive/MyDrive/Colab Notebooks/spheroid-seg/data`)
 into the repo's `data/` directory using `shutil.copytree(..., dirs_exist_ok=True)`.
-Paths containing spaces are handled without shelling out.
+Paths containing spaces are handled without shelling out. If the Drive path is
+missing after mounting, the cell raises — Drive data never silently falls back
+to synthetic.
 
 Leave `USE_DRIVE_DATA = False` (default) to keep the built-in synthetic fallback
 and ensure no private data is uploaded or committed. `data/` is `.gitignore`d
 (except `data/splits/*.txt`), so copied images are never committed to git.
 
 After copying, the cell prints the number of files in `data/raw` and
-`data/masks` and warns if either is zero, so a missing Drive path no longer
-silently falls back to synthetic data.
+`data/masks` and warns if either is zero, so an empty copy is visible.
+
+The same mount also makes training survive Colab session cuts: the training
+cell verifies the mount (`os.path.ismount`), writes a throwaway config whose
+`outputs` branch points into `.../spheroid-seg/runs/` on Drive, and saves
+checkpoints there every epoch. On the next runtime it scans for the newest run
+**matching the selected config prefix** whose `training_state_metadata.yaml`
+reports an epoch below the target, and resumes it with `--resume`. Set
+`FORCE_FRESH = True` to skip the scan; it is a strict fresh-run switch. The
+throwaway config path is derived from the selected config stem
+(`/content/configs/<config_stem>_drive.yaml`), never a fixed filename. If the
+mount cannot be verified, training falls back to local ephemeral outputs and
+session-cut resume is unavailable.
 
 ### GPU memory note
 

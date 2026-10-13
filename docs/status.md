@@ -4,9 +4,12 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-10-08 (next controlled experiment prepared: background CE
-weight 0.5 via `configs/colab_bgweight05.yaml`; per-run patch class-prevalence
-logging added to `train.py`).
+Last updated: 2026-10-09 (notebook refactored into an explicit experiment
+runner: settings-only first cell, resolved execution plan gate, repository
+synchronization with fast-forward-only updates, JAX/CUDA plugin repair, and a
+mandatory post-install JAX GPU gate; next controlled experiment prepared:
+background CE weight 0.5 via `configs/colab_bgweight05.yaml`; per-run patch
+class-prevalence logging added to `train.py`).
 
 ## Modules
 
@@ -18,7 +21,7 @@ logging added to `train.py`).
 | M3 — Training loop | Done | losses (Dice + weighted CE), metrics, TrainState + AdamW, unique run dirs, `--overfit-one-batch`; `bn_momentum` config param added/fixed (0.9 in base/colab) resolving val divergence on small data; see `docs/training.md`. 48 tests green, ruff clean |
 | M4 — Evaluation CLI | Done | per-class Dice/IoU, confusion, overlays, per-magnification grouping, checkpoint resolution; pooled confusion matrix now uses exact uint32 accumulation (fixed float32 saturation at 2**24); proper scoring rules (Brier + log loss from softmax probs, float64 streaming accumulation) added; see `docs/evaluation.md` |
 | M5 — Inference (stitching) | Done | full-image patch stitching with logit averaging; see `docs/inference.md` |
-| Notebook — Colab quickstart | Done | `notebooks/colab_training.ipynb` converted to pip-based install (`pip install -e ".[cuda12,viz]"` GPU / `pip install -e ".[viz]"` CPU), `USE_DRIVE_DATA` flag, streaming `run()` helper, pytest cell removed; `configs/colab.yaml` added for T4 16 GiB (batch_size 4); see `docs/training.md` |
+| Notebook — Colab experiment runner | Done | `notebooks/colab_training.ipynb` refactored into an explicit experiment runner: settings-only first code cell, runtime-derivation/helper cell, resolved execution plan gate (validates config/epochs before any side effect), repository synchronization (dirty-clone guard + fetch + fast-forward-only update + commit SHA), install cell that never skips on importable package and repairs conflicting JAX CUDA plugin families, post-install JAX sanity gate that raises on GPU runtimes unless JAX sees a GPU, overfit-one-batch check guarded by `RUN_OVERFIT_CHECK`, main training cell with no hidden epoch override (prints the exact command; `TRAIN_EPOCHS=None` omits `--epochs`), Drive resume scanning restricted to the selected config prefix, throwaway Drive config derived from the config stem; see `docs/training.md` §Cloud GPU (Colab) |
 | CI — GitHub Actions | Done | lint + `pytest` matrix on Python 3.12/3.13/3.14; see `.github/workflows/ci.yml` |
 | M6 — Post-processing (v0.2) | Pending | instances, morphometrics, hybrid spheroid/organoid classification |
 | M7 — SLiMIA pre-training | Deferred | domain-shift risk; only if own data underperforms |
@@ -143,6 +146,12 @@ class-prevalence logging (§Patch class-prevalence logging in
 composition of this and future runs is auditable from
 `logs/patch_class_prevalence.csv`.
 
+Run it on Colab with the notebook's controlled-experiment settings
+(`docs/training.md` §Controlled experiment settings): the main training cell
+then writes to `outputs/runs/colab_bgweight05_<timestamp>/`, never
+`base_<timestamp>` (that prefix belongs only to the optional
+overfit-one-batch quickstart check).
+
 ## Decisions made after the design doc
 
 - **Synthetic fixtures must correlate raw intensities with masks** (M3): pure
@@ -170,6 +179,20 @@ composition of this and future runs is auditable from
   `base.yaml --overfit-one-batch` + checkpoint download). The notebook drives
   all commands through subprocesses so the Colab kernel stays stock. Actual GPU
   execution is a manual maintainer verification step.
+- **Colab notebook = explicit experiment runner** (2026-10-09): after a real
+  run trained the wrong config (the unconditional GPU overfit cell created
+  `base_20261009_122150` while `colab_bgweight05.yaml` was selected) on a
+  reused runtime with an incompatible `jaxlib 0.10.2` + `jax_cuda13_plugin
+  0.11.1` mix, the notebook was restructured: a settings-only first cell, a
+  resolved execution plan gate before any side effect, repository
+  synchronization (dirty guard + fetch + fast-forward-only + commit SHA), an
+  install cell that never skips on importability and repairs wrong-family CUDA
+  plugins, and a post-install gate that raises unless JAX itself reports a GPU
+  when `nvidia-smi` detected one. The overfit-one-batch check is now guarded by
+  `RUN_OVERFIT_CHECK`, and `TRAIN_EPOCHS = None` means no notebook-level epoch
+  override. A `base_<timestamp>` run now comes only from the quickstart check.
+  Structure is pinned by `tests/test_notebook.py`; full GPU execution on Colab
+  remains a manual maintainer verification step.
 - **Real-data onboarding started** (2026-08-06): 4 annotated images (3× 10x,
   1× 4x) exported from QuPath via `scripts/export_qupath_masks.groovy`, QC
   passed, splits committed. Annotation pitfalls documented in

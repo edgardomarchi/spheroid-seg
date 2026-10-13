@@ -144,9 +144,18 @@ anything locally:
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/edgardomarchi/spheroid-seg/blob/main/notebooks/colab_training.ipynb)
 
-The notebook installs the package with `pip install -e ".[cuda12,viz]"` on GPU
-runtimes and `pip install -e ".[viz]"` on CPU runtimes, then imports the
-package, checks `jax.devices()`, and runs a short training example.
+The notebook is an explicit experiment runner: a user-settings cell, a resolved
+execution plan (printed before any side effect), repository synchronization
+that never silently reuses stale code, and a JAX/CUDA repair step that removes
+conflicting CUDA plugin distributions on reused GPU runtimes. It installs the
+package with `pip install -e ".[cuda12,viz]"` on GPU runtimes and
+`pip install -e ".[viz]"` on CPU runtimes, then enforces a post-install sanity
+gate: on GPU runtimes training cannot start unless `jax.devices()` itself
+reports a GPU. The optional overfit-one-batch check creates a
+`base_<timestamp>` run directory; controlled experiments instead set
+`RUN_OVERFIT_CHECK = False` and `TRAIN_EPOCHS = None` so the selected config
+decides the run. See `docs/training.md` §Cloud GPU (Colab) for the full flow
+and the controlled-experiment settings.
 
 ## Data expectations and real-data onboarding
 
