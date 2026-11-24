@@ -211,7 +211,8 @@ uv run python -m spheroid_seg.validation_diagnostics \
 
 Options: `--config`, `--split` (`val`/`test`), `--run-dir`/`--checkpoint`
 (same resolution as eval), `--background-bias-grid` (comma-separated,
-default `0,0.25,0.5,0.75,1,1.5,2`), `--area-thresholds` (comma-separated
+default `0,0.25,0.5,0.75,1,1.5,2`), `--loose-bias-grid` (comma-separated,
+default `0`; see Part 4 below), `--area-thresholds` (comma-separated
 pixels, default `16,64,256,1024,4096`), `--output-root` (default
 `outputs/diagnostics/`), `--skip-saved-patch-prevalence`, and `--max-images`
 (smoke/debug only — never use it for a real-data acceptance run). Every
@@ -297,13 +298,97 @@ Acceptance invariants (tested in `tests/test_validation_diagnostics*.py`):
 5. object metrics derive from the 3x3 matrix with the documented
    semantics.
 
+### Part 4 — loose-vs-aggregate foreground-bias sweep
+
+An optional extension of Part 3 for the residual loose↔aggregate confusion:
+a post-hoc class-prior shift between the two foreground classes. It is
+diagnostics-only — it never modifies the checkpoint, the saved predictions,
+or any training artifact, and it answers whether the remaining
+loose/aggregate confusion has a useful class-prior component or is
+structural/semantic.
+
+`aggregate` is the **foreground reference class** (its logit is never
+shifted). For each combination `(background_bias, loose_bias)` of the two
+grids, the logits are adjusted before softmax/argmax via the same
+numerically stable log-probability shift as Part 3:
+
+```python
+adjusted_logits[..., background] += background_bias
+adjusted_logits[..., loose_cell] += loose_bias
+# adjusted_logits[..., aggregate] remains unchanged
+```
+
+A positive `loose bias` moves argmax decisions toward `loose cell`, a
+negative one toward `aggregate` (and background), always relative to the
+unchanged aggregate logit. Each tile is still predicted **once**; every
+combination is evaluated from the same per-tile probabilities, and the
+combinations accumulate independently (exact uint32 confusions and float64
+proper sums per combination and group).
+
+- `--loose-bias-grid` takes comma-separated finite, unique floats (negative
+  values allowed; user order preserved; duplicates and non-finite values are
+  rejected like the background grid). Default `0`.
+- When the loose grid is omitted or exactly `0`, the command is unchanged:
+  no Part 4 outputs, `summary.md` identical to the background-only run, and
+  `bias_sweep.csv`/`bias_sweep_confusion.csv` keep their original schemas
+  (they always report the `loose_bias = 0` slice).
+- When the loose grid contains any non-zero value, two additional files are
+  written next to the Part 3 outputs:
+
+`foreground_bias_sweep.csv` — long-format metrics, one block per
+combination and group. Columns: `background_bias,loose_bias,group,class,
+dice,iou,precision,recall,brier,log_loss,gt_pixels,pred_pixels,n_images,
+foreground_macro_dice`. `group` is `overall`/`10x`/`4x` and `class` covers
+the three model classes plus `object` and `all` with the same semantics as
+Part 3 (`object` row: proper scores empty; `all` row: segmentation metrics
+empty). `foreground_macro_dice` is the unweighted mean of the `loose cell`
+and `aggregate` Dice for the same `(background_bias, loose_bias, group)`;
+it is reported on the `loose cell` and `aggregate` rows and left empty on
+`background`/`object`/`all`, where it is not meaningful.
+
+`foreground_bias_confusion.csv` — exact pooled confusion counts. Columns:
+`background_bias,loose_bias,group,gt,prediction,count`, with the same 3x3
+class rows as `bias_sweep_confusion.csv` for every requested combination
+and group.
+
+`summary.md` gains a "## Part 4 — loose-vs-aggregate foreground-bias
+sweep" section with the `overall` table (background bias, loose bias,
+loose/aggregate/macro/object Dice, object precision/recall) and the
+row-normalized transition rates:
+
+- `loose→aggregate rate = confusion(gt=loose cell, prediction=aggregate) / total GT loose cell pixels`
+- `aggregate→loose rate = confusion(gt=aggregate, prediction=loose cell) / total GT aggregate pixels`
+
+plus the best `overall` combinations by maximum foreground macro Dice,
+loose cell Dice, aggregate Dice, and object Dice (all exact ties reported).
+
+The intended Colab command for the current background-weight-0.5
+experiment (`configs/colab_bgweight05.yaml`):
+
+```bash
+python -m spheroid_seg.validation_diagnostics \
+    --config configs/base.yaml \
+    --run-dir "/content/drive/MyDrive/Colab Notebooks/spheroid-seg/runs/colab_bgweight05_drive_20261013_131654" \
+    --split val \
+    --background-bias-grid 0,0.5 \
+    --loose-bias-grid -1,-0.5,0,0.5,1 \
+    --area-thresholds 16,64,256,1024,4096
+```
+
+> Warning: this is a **post-hoc diagnostic**. It shifts class logits at
+> inference time to probe the decision boundary; it does not modify the
+> checkpoint, retrain, or change the evaluation/training pipeline. Treat any
+> "best" bias as a hypothesis for the next controlled experiment, not as a
+> model improvement.
+
 ### Memory and streaming guarantees
 
 The diagnostics loop streams like eval: one image is loaded, tiled, and
-predicted once; per-tile probabilities feed all bias accumulators and the
-baseline reassembly, then are released. Across images only small aggregated
-state survives (uint32 confusion counts, float64 proper-score partial sums,
-per-component scalar rows) — per-image probability maps are never retained.
+predicted once; per-tile probabilities feed all bias-combination
+accumulators and the baseline reassembly, then are released. Across images
+only small aggregated state survives (uint32 confusion counts, float64
+proper-score partial sums, per-component scalar rows) — per-image
+probability maps are never retained.
 Part 1 reads one mask or one NPZ array at a time. Peak RSS therefore stays
 bounded by one image plus a constant accumulator budget regardless of split
 size; `tests/test_validation_diagnostics_memory.py` guards this the same way

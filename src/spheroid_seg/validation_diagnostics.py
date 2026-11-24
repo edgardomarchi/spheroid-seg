@@ -1,8 +1,8 @@
-"""Validation diagnostics: prevalence, false-positive components, bias sweep.
+"""Validation diagnostics: prevalence, false-positive components, bias sweeps.
 
-Three read-only analyses over a selected evaluation split (normally
-``val``) that explain the current model's foreground overprediction before
-any training change is considered:
+Read-only analyses over a selected evaluation split (normally ``val``) that
+explain the current model's foreground overprediction before any training
+change is considered:
 
 1. Exact class-pixel prevalence in full-image train/val masks and in the
    saved augmented patches of a training run (``training_patches.npz``).
@@ -10,6 +10,9 @@ any training change is considered:
    false-positive pixels (object / loose cell / aggregate analyses).
 3. A post-hoc background-logit-bias sweep computed from the model
    probabilities without retraining.
+4. An optional post-hoc loose-vs-aggregate foreground-bias sweep (``aggregate``
+   stays the reference foreground class) that reuses the same per-tile
+   probabilities, optionally combined with the background bias.
 
 The command is streaming by design: each image is tiled, predicted once,
 folded into small accumulators (uint32 confusion counts, float64 proper
@@ -55,6 +58,7 @@ CLASS_NAMES = eval_module.CLASS_NAMES
 # Post-hoc background biases and component area thresholds (pixels). These are
 # diagnostic parameters with stable defaults, overridable via the CLI.
 DEFAULT_BACKGROUND_BIAS_GRID = (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+DEFAULT_LOOSE_BIAS_GRID = (0.0,)
 DEFAULT_AREA_THRESHOLDS = (16, 64, 256, 1024, 4096)
 
 # False-positive analyses: any foreground pixel outside ground-truth
@@ -432,25 +436,31 @@ def component_summary(
 # ---------------------------------------------------------------------------
 
 
-def parse_bias_grid(text: str) -> tuple[float, ...]:
-    """Parse a comma-separated background-bias grid.
+def parse_bias_grid(text: str, flag: str = "--background-bias-grid") -> tuple[float, ...]:
+    """Parse a comma-separated logit-bias grid.
 
     Values must be finite and unique; order is preserved. An exact ``0.0``
     entry selects the bit-identical fast path (raw probabilities, no log
-    transform) so bias 0 reproduces the existing eval exactly.
+    transform) so bias 0 reproduces the existing eval exactly. ``flag`` is
+    the CLI option name used in error messages.
     """
     parts = [part.strip() for part in text.split(",") if part.strip()]
     if not parts:
-        raise ValueError("Invalid --background-bias-grid: at least one value is required")
+        raise ValueError(f"Invalid {flag}: at least one value is required")
     try:
         values = tuple(float(part) for part in parts)
     except ValueError as exc:
-        raise ValueError(f"Invalid --background-bias-grid {text!r}: not a number") from exc
+        raise ValueError(f"Invalid {flag} {text!r}: not a number") from exc
     if any(math.isnan(v) or math.isinf(v) for v in values):
-        raise ValueError(f"Invalid --background-bias-grid {text!r}: values must be finite")
+        raise ValueError(f"Invalid {flag} {text!r}: values must be finite")
     if len(set(values)) != len(values):
-        raise ValueError(f"Invalid --background-bias-grid {text!r}: duplicate values")
+        raise ValueError(f"Invalid {flag} {text!r}: duplicate values")
     return values
+
+
+def parse_loose_bias_grid(text: str) -> tuple[float, ...]:
+    """Parse the ``--loose-bias-grid`` argument (same rules as the background grid)."""
+    return parse_bias_grid(text, flag="--loose-bias-grid")
 
 
 def parse_area_thresholds(text: str) -> tuple[int, ...]:
@@ -474,46 +484,74 @@ def parse_area_thresholds(text: str) -> tuple[int, ...]:
     return tuple(values)
 
 
-def adjusted_prediction(probs: np.ndarray, background_bias: float) -> tuple[np.ndarray, np.ndarray]:
-    """Argmax and adjusted probabilities under a background-logit bias.
+def adjusted_prediction(
+    probs: np.ndarray,
+    background_bias: float = 0.0,
+    loose_bias: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Argmax and adjusted probabilities under background and loose-cell logit biases.
 
-    The model output is softmax probabilities, not logits. Adding ``delta``
-    to the background logit is applied as the mathematically equivalent
-    log-probability shift::
+    The model output is softmax probabilities, not logits. Adding ``delta_bg``
+    to the background logit and ``delta_loose`` to the loose-cell logit is
+    applied as the mathematically equivalent log-probability shift::
 
-        adjusted_logp = log(probs) + delta * one_hot(background)
+        adjusted_logp = log(probs) + delta_bg * one_hot(background)
+                                   + delta_loose * one_hot(loose cell)
         adjusted_probs = softmax(adjusted_logp)
 
-    so boosting the background class leaves the relative foreground order
-    unchanged and can only move argmax decisions toward background. At
-    ``delta == 0`` the original probabilities are returned untouched, which
-    keeps the bias-0 accumulation bit-identical to the existing eval path.
+    ``aggregate`` is the foreground reference class: its logit is never
+    shifted, so the loose bias moves argmax decisions between ``loose cell``
+    and ``aggregate``/``background`` without retraining. At
+    ``delta_bg == delta_loose == 0`` the original probabilities are returned
+    untouched, which keeps the bias-0 accumulation bit-identical to the
+    existing eval path.
 
     One numerical corner, mirroring exact softmax semantics: the model emits
-    float32 probabilities, and a background probability can underflow to
-    exactly 0.0 for extremely confident foreground tiles; ``log(0) = -inf``
-    means no finite bias can flip such a pixel to background. Pixels with any
-    positive background probability flip once the bias exceeds their log-odds
-    gap, so a sufficiently large grid still drives the foreground count to
-    the underflow-pixel floor.
+    float32 probabilities, and a class probability can underflow to exactly
+    0.0 for extremely confident tiles; ``log(0) = -inf`` means no finite bias
+    can revive such a pixel. Pixels with any positive probability flip once
+    the bias exceeds their log-odds gap.
 
     Args:
         probs: Softmax probabilities of shape ``(..., C)``.
-        background_bias: Bias ``delta`` added to the background logit.
+        background_bias: Bias ``delta_bg`` added to the background (class 0) logit.
+        loose_bias: Bias ``delta_loose`` added to the loose-cell (class 1) logit.
 
     Returns:
         Tuple ``(argmax prediction, probabilities)``; probabilities are
         float64 for non-zero biases and the original array for zero.
     """
     probs = np.asarray(probs)
-    if background_bias == 0.0:
+    if background_bias == 0.0 and loose_bias == 0.0:
         return np.argmax(probs, axis=-1), probs
     logp = np.log(probs.astype(np.float64))  # log(0) -> -inf, handled by softmax
     logp[..., 0] += background_bias
+    logp[..., 1] += loose_bias
     logp -= np.max(logp, axis=-1, keepdims=True)
     exp = np.exp(logp)
     adjusted = exp / exp.sum(axis=-1, keepdims=True)
     return np.argmax(adjusted, axis=-1), adjusted
+
+
+def foreground_transition_rates(confusion: np.ndarray) -> dict[str, float]:
+    """Row-normalized loose<->aggregate transition rates of a 3x3 confusion matrix.
+
+    ``loose_to_aggregate`` is the fraction of GT loose-cell pixels predicted
+    as aggregate (``C[1, 2] / C[1, :].sum()``); ``aggregate_to_loose`` is the
+    fraction of GT aggregate pixels predicted as loose cell
+    (``C[2, 1] / C[2, :].sum()``). A rate is NaN when its GT row is empty —
+    never an invented convention.
+    """
+    confusion = np.asarray(confusion, dtype=np.float64)
+    loose_row = confusion[1].sum()
+    aggregate_row = confusion[2].sum()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        loose_to_aggregate = confusion[1, 2] / loose_row if loose_row > 0 else math.nan
+        aggregate_to_loose = confusion[2, 1] / aggregate_row if aggregate_row > 0 else math.nan
+    return {
+        "loose_to_aggregate": float(loose_to_aggregate),
+        "aggregate_to_loose": float(aggregate_to_loose),
+    }
 
 
 def precision_recall_from_confusion(confusion: np.ndarray) -> dict[str, np.ndarray]:
@@ -546,26 +584,42 @@ def object_precision_recall_from_3x3(confusion: np.ndarray) -> tuple[float, floa
 
 
 class BiasGridAccumulators:
-    """Pooled confusion counts and proper-score sums for a grid of biases.
+    """Pooled confusion counts and proper-score sums for a grid of bias combinations.
 
-    State per bias value and per group (``overall`` plus magnification
-    groups): a uint32 3x3 confusion matrix and float64 proper-score partial
-    sums. Proper sums are staged per image and folded into the group
-    accumulators once per image — the same nesting as the eval path — so
-    bias 0 is bit-identical to :func:`spheroid_seg.eval.evaluate_split`.
+    The grid is the Cartesian product of the background-bias grid and the
+    loose-bias grid (``aggregate`` is the un-biased reference foreground
+    class). State per combination and per group (``overall`` plus
+    magnification groups): a uint32 3x3 confusion matrix and float64
+    proper-score partial sums. Proper sums are staged per image and folded
+    into the group accumulators once per image — the same nesting as the eval
+    path — so bias 0 is bit-identical to :func:`spheroid_seg.eval.evaluate_split`.
     Confusion counts are exact integers, so they fold per tile.
 
     Usage: ``begin_image()`` before an image's tiles, ``add_tile(...)`` per
     valid tile region, ``end_image(groups)`` after the image.
     """
 
-    def __init__(self, bias_grid: tuple[float, ...], num_classes: int) -> None:
-        """Create accumulators for ``bias_grid`` with ``num_classes`` classes."""
+    def __init__(
+        self,
+        bias_grid: tuple[float, ...],
+        num_classes: int,
+        loose_bias_grid: tuple[float, ...] = DEFAULT_LOOSE_BIAS_GRID,
+    ) -> None:
+        """Create accumulators for the ``bias_grid`` x ``loose_bias_grid`` product."""
         self.bias_grid = tuple(bias_grid)
+        self.loose_bias_grid = tuple(loose_bias_grid)
         self.num_classes = num_classes
-        self._confusions: list[dict[str, np.ndarray]] = [{} for _ in self.bias_grid]
-        self._sums: list[dict[str, dict[str, Any]]] = [{} for _ in self.bias_grid]
-        self._staged: list[dict[str, Any] | None] = [None for _ in self.bias_grid]
+        # Product order: background-major, then loose. With the default loose
+        # grid ``(0.0,)`` the combination indices align 1:1 with the old
+        # background-only indices, keeping every existing output unchanged.
+        self.combinations: tuple[tuple[float, float], ...] = tuple(
+            (background_bias, loose_bias)
+            for background_bias in self.bias_grid
+            for loose_bias in self.loose_bias_grid
+        )
+        self._confusions: list[dict[str, np.ndarray]] = [{} for _ in self.combinations]
+        self._sums: list[dict[str, dict[str, Any]]] = [{} for _ in self.combinations]
+        self._staged: list[dict[str, Any] | None] = [None for _ in self.combinations]
 
     def _confusion(self, delta_index: int, group: str) -> np.ndarray:
         matrix = self._confusions[delta_index].get(group)
@@ -583,7 +637,7 @@ class BiasGridAccumulators:
 
     def begin_image(self) -> None:
         """Start a new image: reset the per-image proper-score staging."""
-        self._staged = [None for _ in self.bias_grid]
+        self._staged = [None for _ in self.combinations]
 
     def add_tile(
         self,
@@ -616,7 +670,7 @@ class BiasGridAccumulators:
             self._staged[delta_index] = None
 
     def confusion(self, delta_index: int, group: str) -> np.ndarray:
-        """Return the accumulated confusion matrix for one bias and group."""
+        """Return the accumulated confusion matrix for one combination and group."""
         return self._confusions[delta_index][group]
 
     def groups(self, delta_index: int = 0) -> list[str]:
@@ -626,47 +680,84 @@ class BiasGridAccumulators:
         ordered.extend(sorted(names - set(ordered)))
         return ordered
 
+    def _loose_zero_indices(self) -> list[int]:
+        """Combination indices of the background sweep slice (``loose_bias == 0``)."""
+        return [
+            index for index, (_, loose_bias) in enumerate(self.combinations) if loose_bias == 0.0
+        ]
+
+    def _reduction(self, delta_index: int, group: str, n_images: dict[str, int]) -> dict[str, Any]:
+        """Shared per-(combination, group) metric reduction for both sweep CSVs.
+
+        Uses the same reductions as the eval report (``class_metrics_from_confusion``,
+        float32 on exact uint32 counts) so bias 0 matches eval's reported
+        Dice/IoU bit for bit, not just mathematically.
+        """
+        confusion = self.confusion(delta_index, group)
+        pooled = eval_module.class_metrics_from_confusion(confusion)
+        dice = np.asarray(pooled["dice"])
+        iou = np.asarray(pooled["iou"])
+        scores = precision_recall_from_confusion(confusion)
+        obj = eval_module.object_metrics_from_3x3(confusion)
+        obj_precision, obj_recall = object_precision_recall_from_3x3(confusion)
+        proper = finalize_proper_scores(self._sums_for(delta_index, group), self.num_classes)
+        gt_counts = confusion.sum(axis=1)
+        pred_counts = confusion.sum(axis=0)
+        return {
+            "confusion": confusion,
+            "dice": dice,
+            "iou": iou,
+            "precision": scores["precision"],
+            "recall": scores["recall"],
+            "obj_dice": float(obj["dice"]),
+            "obj_iou": float(obj["iou"]),
+            "obj_precision": obj_precision,
+            "obj_recall": obj_recall,
+            "brier_per_class": np.asarray(proper["brier_per_class"]),
+            "log_loss_per_class": np.asarray(proper["log_loss_per_class"]),
+            "brier": float(proper["brier"]),
+            "log_loss": float(proper["log_loss"]),
+            "gt_counts": gt_counts,
+            "pred_counts": pred_counts,
+            "obj_gt": int(confusion[1:, :].sum()),
+            "obj_pred": int(confusion[:, 1:].sum()),
+            "total": int(confusion.sum()),
+            "n_images": n_images[group],
+            # float64 mean of the two reported (float32) Dice values.
+            "foreground_macro_dice": (float(dice[1]) + float(dice[2])) / 2.0,
+        }
+
     def finalize(self, n_images: dict[str, int]) -> list[list[Any]]:
-        """Reduce all accumulators to ``bias_sweep.csv`` rows (long format)."""
+        """Reduce the loose-bias-0 slice to ``bias_sweep.csv`` rows (long format).
+
+        Rows come only from combinations with ``loose_bias == 0`` so the file
+        keeps its original background-sweep schema; the full product lands in
+        :meth:`finalize_foreground`. With the default loose grid this covers
+        every combination and the output is unchanged from the original
+        background-only sweep.
+        """
         if any(staged is not None for staged in self._staged):
             raise ValueError("BiasGridAccumulators: end_image() was not called")
         rows: list[list[Any]] = []
-        for delta_index, delta in enumerate(self.bias_grid):
-            delta_str = repr(float(delta))
+        for delta_index in self._loose_zero_indices():
+            delta_str = repr(float(self.combinations[delta_index][0]))
             for group in self.groups(delta_index):
-                confusion = self.confusion(delta_index, group)
-                # Same reduction as the eval report (class_metrics_from_confusion,
-                # float32 on exact uint32 counts) so bias 0 matches eval's
-                # reported Dice/IoU bit for bit, not just mathematically.
-                pooled = eval_module.class_metrics_from_confusion(confusion)
-                dice = np.asarray(pooled["dice"])
-                iou = np.asarray(pooled["iou"])
-                scores = precision_recall_from_confusion(confusion)
-                obj = eval_module.object_metrics_from_3x3(confusion)
-                obj_precision, obj_recall = object_precision_recall_from_3x3(confusion)
-                proper = finalize_proper_scores(
-                    self._sums_for(delta_index, group), self.num_classes
-                )
-                gt_counts = confusion.sum(axis=1)
-                pred_counts = confusion.sum(axis=0)
-                obj_gt = int(confusion[1:, :].sum())
-                obj_pred = int(confusion[:, 1:].sum())
-                total = int(confusion.sum())
-                n = n_images[group]
+                reduced = self._reduction(delta_index, group, n_images)
+                n = reduced["n_images"]
                 for cls in range(self.num_classes):
                     rows.append(
                         [
                             delta_str,
                             group,
                             CLASS_NAMES[cls],
-                            float(dice[cls]),
-                            float(iou[cls]),
-                            float(scores["precision"][cls]),
-                            float(scores["recall"][cls]),
-                            float(proper["brier_per_class"][cls]),
-                            float(proper["log_loss_per_class"][cls]),
-                            int(gt_counts[cls]),
-                            int(pred_counts[cls]),
+                            float(reduced["dice"][cls]),
+                            float(reduced["iou"][cls]),
+                            float(reduced["precision"][cls]),
+                            float(reduced["recall"][cls]),
+                            float(reduced["brier_per_class"][cls]),
+                            float(reduced["log_loss_per_class"][cls]),
+                            int(reduced["gt_counts"][cls]),
+                            int(reduced["pred_counts"][cls]),
                             n,
                         ]
                     )
@@ -675,14 +766,14 @@ class BiasGridAccumulators:
                         delta_str,
                         group,
                         "object",
-                        float(obj["dice"]),
-                        float(obj["iou"]),
-                        obj_precision,
-                        obj_recall,
+                        reduced["obj_dice"],
+                        reduced["obj_iou"],
+                        reduced["obj_precision"],
+                        reduced["obj_recall"],
                         float("nan"),
                         float("nan"),
-                        obj_gt,
-                        obj_pred,
+                        reduced["obj_gt"],
+                        reduced["obj_pred"],
                         n,
                     ]
                 )
@@ -695,26 +786,135 @@ class BiasGridAccumulators:
                         float("nan"),
                         float("nan"),
                         float("nan"),
-                        float(proper["brier"]),
-                        float(proper["log_loss"]),
-                        total,
-                        total,
+                        reduced["brier"],
+                        reduced["log_loss"],
+                        reduced["total"],
+                        reduced["total"],
                         n,
                     ]
                 )
         return rows
 
-    def confusion_rows(self) -> list[list[Any]]:
-        """Long-format confusion counts for ``bias_sweep_confusion.csv``."""
+    def finalize_foreground(self, n_images: dict[str, int]) -> list[list[Any]]:
+        """Reduce every combination to ``foreground_bias_sweep.csv`` rows.
+
+        Same long-format rows as :meth:`finalize` plus a leading ``loose_bias``
+        column and a trailing ``foreground_macro_dice`` column. The macro Dice
+        (unweighted mean of loose-cell and aggregate Dice) is reported on the
+        ``loose cell`` and ``aggregate`` rows and left empty (NaN) on the
+        ``background``/``object``/``all`` rows, where it is not meaningful.
+        """
+        if any(staged is not None for staged in self._staged):
+            raise ValueError("BiasGridAccumulators: end_image() was not called")
         rows: list[list[Any]] = []
-        for delta_index, delta in enumerate(self.bias_grid):
-            delta_str = repr(float(delta))
+        for delta_index, (background_bias, loose_bias) in enumerate(self.combinations):
+            delta_str = repr(float(background_bias))
+            loose_str = repr(float(loose_bias))
+            for group in self.groups(delta_index):
+                reduced = self._reduction(delta_index, group, n_images)
+                macro = reduced["foreground_macro_dice"]
+                n = reduced["n_images"]
+                for cls in range(self.num_classes):
+                    rows.append(
+                        [
+                            delta_str,
+                            loose_str,
+                            group,
+                            CLASS_NAMES[cls],
+                            float(reduced["dice"][cls]),
+                            float(reduced["iou"][cls]),
+                            float(reduced["precision"][cls]),
+                            float(reduced["recall"][cls]),
+                            float(reduced["brier_per_class"][cls]),
+                            float(reduced["log_loss_per_class"][cls]),
+                            int(reduced["gt_counts"][cls]),
+                            int(reduced["pred_counts"][cls]),
+                            n,
+                            macro
+                            if CLASS_NAMES[cls] in ("loose cell", "aggregate")
+                            else float("nan"),
+                        ]
+                    )
+                rows.append(
+                    [
+                        delta_str,
+                        loose_str,
+                        group,
+                        "object",
+                        reduced["obj_dice"],
+                        reduced["obj_iou"],
+                        reduced["obj_precision"],
+                        reduced["obj_recall"],
+                        float("nan"),
+                        float("nan"),
+                        reduced["obj_gt"],
+                        reduced["obj_pred"],
+                        n,
+                        float("nan"),
+                    ]
+                )
+                rows.append(
+                    [
+                        delta_str,
+                        loose_str,
+                        group,
+                        "all",
+                        float("nan"),
+                        float("nan"),
+                        float("nan"),
+                        float("nan"),
+                        reduced["brier"],
+                        reduced["log_loss"],
+                        reduced["total"],
+                        reduced["total"],
+                        n,
+                        float("nan"),
+                    ]
+                )
+        return rows
+
+    def confusion_rows(self) -> list[list[Any]]:
+        """Long-format confusion counts for ``bias_sweep_confusion.csv``.
+
+        Rows come only from combinations with ``loose_bias == 0`` so the file
+        keeps its original schema; the full product lands in
+        :meth:`foreground_confusion_rows`.
+        """
+        rows: list[list[Any]] = []
+        for delta_index in self._loose_zero_indices():
+            delta_str = repr(float(self.combinations[delta_index][0]))
             for group in self.groups(delta_index):
                 confusion = self.confusion(delta_index, group)
                 for gt_idx, gt_name in enumerate(CLASS_NAMES[: self.num_classes]):
                     for pred_idx, pred_name in enumerate(CLASS_NAMES[: self.num_classes]):
                         rows.append(
                             [delta_str, group, gt_name, pred_name, int(confusion[gt_idx, pred_idx])]
+                        )
+        return rows
+
+    def foreground_confusion_rows(self) -> list[list[Any]]:
+        """Long-format confusion counts for ``foreground_bias_confusion.csv``.
+
+        Exact pooled counts for every requested ``(background_bias, loose_bias)``
+        combination, group, and 3x3 class cell.
+        """
+        rows: list[list[Any]] = []
+        for delta_index, (background_bias, loose_bias) in enumerate(self.combinations):
+            delta_str = repr(float(background_bias))
+            loose_str = repr(float(loose_bias))
+            for group in self.groups(delta_index):
+                confusion = self.confusion(delta_index, group)
+                for gt_idx, gt_name in enumerate(CLASS_NAMES[: self.num_classes]):
+                    for pred_idx, pred_name in enumerate(CLASS_NAMES[: self.num_classes]):
+                        rows.append(
+                            [
+                                delta_str,
+                                loose_str,
+                                group,
+                                gt_name,
+                                pred_name,
+                                int(confusion[gt_idx, pred_idx]),
+                            ]
                         )
         return rows
 
@@ -763,15 +963,19 @@ def sweep_full_image(
             r0, r1, c0, c1 = valid_slices[idx]
             gt_valid = mask_tiles[idx, r0:r1, c0:c1]
             probs_valid = probs[offset, r0:r1, c0:c1]
-            for delta_index, delta in enumerate(accumulators.bias_grid):
-                if delta == 0.0:
+            for combo_index, (background_bias, loose_bias) in enumerate(accumulators.combinations):
+                if background_bias == 0.0 and loose_bias == 0.0:
                     # Exact-eval path: raw probabilities, no log transform.
                     pred_valid = np.argmax(probs_valid, axis=-1)
                     probs_for_scores = probs_valid
                 else:
-                    pred_valid, probs_for_scores = adjusted_prediction(probs_valid, delta)
+                    pred_valid, probs_for_scores = adjusted_prediction(
+                        probs_valid,
+                        background_bias=background_bias,
+                        loose_bias=loose_bias,
+                    )
                 accumulators.add_tile(
-                    delta_index,
+                    combo_index,
                     ("overall", mag),
                     pred_valid,
                     gt_valid,
@@ -866,12 +1070,15 @@ def run_diagnostics(
     output_root: Path,
     max_images: int | None = None,
     skip_saved_patch_prevalence: bool = False,
+    loose_bias_grid: tuple[float, ...] = DEFAULT_LOOSE_BIAS_GRID,
 ) -> Path:
-    """Run all three diagnostics analyses and write their outputs.
+    """Run all diagnostics analyses and write their outputs.
 
     Images are processed one at a time; only small aggregated state
     (confusion counts, proper-score partial sums, per-component scalar
-    statistics) survives across images.
+    statistics) survives across images. Each image is predicted once and
+    every requested ``(background_bias, loose_bias)`` combination is
+    evaluated from the same per-tile probabilities (post-hoc only).
 
     Returns:
         The unique output directory containing the CSVs and ``summary.md``.
@@ -923,7 +1130,7 @@ def run_diagnostics(
         if max_images is not None:
             entries = entries[:max_images]
 
-        accumulators = BiasGridAccumulators(bias_grid, num_classes)
+        accumulators = BiasGridAccumulators(bias_grid, num_classes, loose_bias_grid=loose_bias_grid)
         n_images: dict[str, int] = {}
         component_rows: list[dict[str, Any]] = []
         summary_rows: list[dict[str, Any]] = []
@@ -1066,6 +1273,38 @@ def run_diagnostics(
     )
     print(f"Part 3 (bias sweep) written to {output_dir / 'bias_sweep.csv'}")
 
+    # ---- Part 4 outputs (only when the loose grid is not the default) -------
+    foreground_requested = loose_bias_grid != DEFAULT_LOOSE_BIAS_GRID
+    if foreground_requested:
+        _write_csv(
+            output_dir / "foreground_bias_sweep.csv",
+            [
+                "background_bias",
+                "loose_bias",
+                "group",
+                "class",
+                "dice",
+                "iou",
+                "precision",
+                "recall",
+                "brier",
+                "log_loss",
+                "gt_pixels",
+                "pred_pixels",
+                "n_images",
+                "foreground_macro_dice",
+            ],
+            accumulators.finalize_foreground(n_images),
+        )
+        _write_csv(
+            output_dir / "foreground_bias_confusion.csv",
+            ["background_bias", "loose_bias", "group", "gt", "prediction", "count"],
+            accumulators.foreground_confusion_rows(),
+        )
+        print(
+            f"Part 4 (foreground bias sweep) written to {output_dir / 'foreground_bias_sweep.csv'}"
+        )
+
     # ---- Markdown summary ---------------------------------------------------
     _write_summary(
         output_dir / "summary.md",
@@ -1074,6 +1313,7 @@ def run_diagnostics(
         checkpoint_path=Path(checkpoint_path),
         run_dir=Path(run_dir) if run_dir is not None else None,
         bias_grid=bias_grid,
+        loose_bias_grid=loose_bias_grid,
         area_thresholds=area_thresholds,
         max_images=max_images,
         skip_saved_patch_prevalence=skip_saved_patch_prevalence,
@@ -1089,6 +1329,101 @@ def run_diagnostics(
     return output_dir
 
 
+def select_best_combinations(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    """All rows attaining the maximum value of ``key`` (exact ties included).
+
+    NaN values never win and are never selected; when every row is NaN the
+    result is empty.
+    """
+    best: float | None = None
+    for row in rows:
+        value = row.get(key)
+        if not isinstance(value, float) or math.isnan(value):
+            continue
+        if best is None or value > best:
+            best = value
+    if best is None:
+        return []
+    return [
+        row
+        for row in rows
+        if isinstance(row.get(key), float) and not math.isnan(row[key]) and row[key] == best
+    ]
+
+
+def _foreground_sweep_rows(accumulators: BiasGridAccumulators) -> list[dict[str, Any]]:
+    """One summary row per ``(background_bias, loose_bias)`` combination (overall group)."""
+    rows: list[dict[str, Any]] = []
+    for delta_index, (background_bias, loose_bias) in enumerate(accumulators.combinations):
+        if "overall" not in accumulators._confusions[delta_index]:
+            continue
+        confusion = accumulators.confusion(delta_index, "overall")
+        pooled = eval_module.class_metrics_from_confusion(confusion)
+        dice = np.asarray(pooled["dice"])
+        obj = eval_module.object_metrics_from_3x3(confusion)
+        obj_precision, obj_recall = object_precision_recall_from_3x3(confusion)
+        rates = foreground_transition_rates(confusion)
+        rows.append(
+            {
+                "background_bias": float(background_bias),
+                "loose_bias": float(loose_bias),
+                "loose_dice": float(dice[1]),
+                "aggregate_dice": float(dice[2]),
+                "foreground_macro_dice": (float(dice[1]) + float(dice[2])) / 2.0,
+                "object_dice": float(obj["dice"]),
+                "object_precision": obj_precision,
+                "object_recall": obj_recall,
+                "loose_to_aggregate_rate": rates["loose_to_aggregate"],
+                "aggregate_to_loose_rate": rates["aggregate_to_loose"],
+            }
+        )
+    return rows
+
+
+def _foreground_sweep_summary_block(rows: list[dict[str, Any]]) -> str:
+    """Markdown for the Part 4 section: overall table plus best combinations."""
+    lines = [
+        "## Part 4 — loose-vs-aggregate foreground-bias sweep",
+        "",
+        "`aggregate` is the foreground reference class (bias 0); the loose-cell "
+        "logit is shifted by `loose bias` and the background logit by "
+        "`background bias` (Part 3 semantics), all post-hoc from the same "
+        "per-tile probabilities — the checkpoint and predictions are never "
+        "modified. Overall group:",
+        "",
+        "| background bias | loose bias | loose Dice | aggregate Dice |"
+        " foreground macro Dice | object Dice | object precision | object recall"
+        " | loose→aggregate rate | aggregate→loose rate |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['background_bias']} | {row['loose_bias']} "
+            f"| {row['loose_dice']:.4f} | {row['aggregate_dice']:.4f} "
+            f"| {row['foreground_macro_dice']:.4f} | {row['object_dice']:.4f} "
+            f"| {row['object_precision']:.4f} | {row['object_recall']:.4f} "
+            f"| {row['loose_to_aggregate_rate']:.4f} "
+            f"| {row['aggregate_to_loose_rate']:.4f} |"
+        )
+    lines += ["", "### Best combinations (overall)", ""]
+    for label, key in (
+        ("foreground macro Dice", "foreground_macro_dice"),
+        ("loose cell Dice", "loose_dice"),
+        ("aggregate Dice", "aggregate_dice"),
+        ("object Dice", "object_dice"),
+    ):
+        best = select_best_combinations(rows, key)
+        if not best:
+            lines.append(f"- max {label}: n/a (no finite value)")
+            continue
+        combos = "; ".join(
+            f"(background bias {row['background_bias']}, loose bias {row['loose_bias']})"
+            for row in best
+        )
+        lines.append(f"- max {label} ({best[0][key]:.4f}): {combos}")
+    return "\n".join(lines)
+
+
 def _write_summary(
     path: Path,
     *,
@@ -1097,6 +1432,7 @@ def _write_summary(
     checkpoint_path: Path,
     run_dir: Path | None,
     bias_grid: tuple[float, ...],
+    loose_bias_grid: tuple[float, ...],
     area_thresholds: tuple[int, ...],
     max_images: int | None,
     skip_saved_patch_prevalence: bool,
@@ -1118,6 +1454,10 @@ def _write_summary(
         f"- checkpoint: `{checkpoint_path}`",
         f"- run dir: `{run_dir}`" if run_dir is not None else "- run dir: n/a",
         f"- background bias grid: {list(bias_grid)}",
+    ]
+    if loose_bias_grid != DEFAULT_LOOSE_BIAS_GRID:
+        lines.append(f"- loose bias grid: {list(loose_bias_grid)}")
+    lines += [
         f"- area thresholds (px): {list(area_thresholds)}",
         f"- images analyzed: {n_images.get('overall', 0)}"
         + (f" (--max-images {max_images}; smoke/debug only)" if max_images else ""),
@@ -1155,19 +1495,22 @@ def _write_summary(
         " | predicted foreground px |",
         "|---|---:|---:|---:|---:|---:|",
     ]
-    zero_index = next((i for i, d in enumerate(accumulators.bias_grid) if d == 0.0), None)
-    for delta_index, delta in enumerate(accumulators.bias_grid):
+    for delta_index in accumulators._loose_zero_indices():
+        delta = accumulators.combinations[delta_index][0]
         if "overall" not in accumulators._confusions[delta_index]:
             continue
         confusion = accumulators.confusion(delta_index, "overall")
         obj = eval_module.object_metrics_from_3x3(confusion)
         obj_precision, obj_recall = object_precision_recall_from_3x3(confusion)
         fg_pixels = int(confusion[:, 1:].sum())
-        marker = " (baseline)" if delta_index == zero_index else ""
+        marker = " (baseline)" if delta == 0.0 else ""
         lines.append(
             f"| {float(delta)} | {float(obj['dice']):.4f} | {float(obj['iou']):.4f} "
             f"| {obj_precision:.4f} | {obj_recall:.4f} | {fg_pixels}{marker} |"
         )
+
+    if loose_bias_grid != DEFAULT_LOOSE_BIAS_GRID:
+        lines += ["", _foreground_sweep_summary_block(_foreground_sweep_rows(accumulators)), ""]
 
     path.write_text("\n".join(lines) + "\n")
 
@@ -1201,11 +1544,35 @@ def _pooled_component_line(
     )
 
 
+def _normalize_bias_flag_args(argv: list[str]) -> list[str]:
+    """Join ``--<bias-flag> VALUE`` pairs so grids may start with '-' (e.g. ``-1,0,1``).
+
+    argparse refuses space-separated values that look like options; the
+    documented commands pass negative grids (``--loose-bias-grid -1,-0.5,0``),
+    so the value is re-attached with ``=`` before parsing. A following token
+    starting with ``--`` is left alone, preserving argparse's standard
+    "expected one argument" error for a missing value.
+    """
+    value_flags = ("--background-bias-grid", "--loose-bias-grid")
+    normalized: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in value_flags and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            normalized.append(f"{arg}={argv[index + 1]}")
+            index += 2
+        else:
+            normalized.append(arg)
+            index += 1
+    return normalized
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point for the validation diagnostics command."""
     parser = argparse.ArgumentParser(
         description="Validation diagnostics: prevalence, false-positive components, "
-        "and a post-hoc background-logit-bias sweep. Read-only; never trains."
+        "and post-hoc logit-bias sweeps (background; loose-vs-aggregate foreground). "
+        "Read-only; never trains."
     )
     parser.add_argument("--config", required=True, help="Path to the YAML configuration file.")
     parser.add_argument(
@@ -1222,6 +1589,13 @@ def main(argv: list[str] | None = None) -> int:
         "--background-bias-grid",
         default=",".join(repr(float(v)) for v in DEFAULT_BACKGROUND_BIAS_GRID),
         help="Comma-separated post-hoc background-logit biases (default: 0,0.25,0.5,0.75,1,1.5,2).",
+    )
+    parser.add_argument(
+        "--loose-bias-grid",
+        default=",".join(repr(float(v)) for v in DEFAULT_LOOSE_BIAS_GRID),
+        help="Comma-separated post-hoc loose-cell-logit biases relative to the "
+        "aggregate reference class (default: 0). A non-default grid additionally "
+        "writes foreground_bias_sweep.csv and foreground_bias_confusion.csv.",
     )
     parser.add_argument(
         "--area-thresholds",
@@ -1246,13 +1620,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip the saved-patch prevalence analysis when the run's "
         "training_patches.npz is unavailable. The skip is recorded in summary.md.",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_normalize_bias_flag_args(sys.argv[1:] if argv is None else argv))
 
     config_path = Path(args.config)
     config = eval_module.load_config(config_path)
 
     try:
         bias_grid = parse_bias_grid(args.background_bias_grid)
+        loose_bias_grid = parse_loose_bias_grid(args.loose_bias_grid)
         area_thresholds = parse_area_thresholds(args.area_thresholds)
         if args.max_images is not None and args.max_images <= 0:
             raise ValueError(f"--max-images must be a positive integer, got {args.max_images}")
@@ -1277,6 +1652,7 @@ def main(argv: list[str] | None = None) -> int:
             output_root=output_root,
             max_images=args.max_images,
             skip_saved_patch_prevalence=args.skip_saved_patch_prevalence,
+            loose_bias_grid=loose_bias_grid,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -25,18 +25,22 @@ from spheroid_seg.validation_diagnostics import (
     ANALYSIS_MASKS,
     DEFAULT_AREA_THRESHOLDS,
     DEFAULT_BACKGROUND_BIAS_GRID,
+    DEFAULT_LOOSE_BIAS_GRID,
     BiasGridAccumulators,
     adjusted_prediction,
     class_pixel_counts,
     component_summary,
     component_table,
     false_positive_mask,
+    foreground_transition_rates,
     full_image_prevalence,
     object_precision_recall_from_3x3,
     parse_area_thresholds,
     parse_bias_grid,
+    parse_loose_bias_grid,
     precision_recall_from_confusion,
     saved_patch_prevalence,
+    select_best_combinations,
     sweep_full_image,
 )
 
@@ -711,3 +715,390 @@ def test_output_dir_never_overwrites_non_empty(tmp_path, monkeypatch) -> None:
     reused = root / "cfg_empty_20261001_120000"
     reused.mkdir(parents=True)
     assert vd._make_output_dir(root, "cfg_empty") == reused
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — loose-vs-aggregate foreground-bias sweep
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_bias_flag_args_allows_leading_dash_values() -> None:
+    """Space-separated grids may start with '-' (the documented negative grids)."""
+    from spheroid_seg.validation_diagnostics import _normalize_bias_flag_args
+
+    argv = [
+        "--config",
+        "c.yaml",
+        "--loose-bias-grid",
+        "-1,-0.5,0",
+        "--background-bias-grid",
+        "-1,0",
+        "--area-thresholds",
+        "16",
+    ]
+    assert _normalize_bias_flag_args(argv) == [
+        "--config",
+        "c.yaml",
+        "--loose-bias-grid=-1,-0.5,0",
+        "--background-bias-grid=-1,0",
+        "--area-thresholds",
+        "16",
+    ]
+    # A following option-looking token is left alone (argparse's standard
+    # "expected one argument" error is preserved for a missing value).
+    assert _normalize_bias_flag_args(["--loose-bias-grid", "--area-thresholds", "16"]) == [
+        "--loose-bias-grid",
+        "--area-thresholds",
+        "16",
+    ]
+    # The '=' form passes through untouched.
+    assert _normalize_bias_flag_args(["--loose-bias-grid=-1,0"]) == ["--loose-bias-grid=-1,0"]
+
+
+def test_parse_loose_bias_grid_defaults_and_whitespace() -> None:
+    """The default grid parses; whitespace is tolerated."""
+    assert parse_loose_bias_grid("0") == DEFAULT_LOOSE_BIAS_GRID == (0.0,)
+    assert parse_loose_bias_grid(" -1 , -0.5 , 0 , 0.5 , 1 ") == (-1.0, -0.5, 0.0, 0.5, 1.0)
+
+
+def test_parse_loose_bias_grid_preserves_user_order() -> None:
+    """User-specified order is preserved exactly (no sorting)."""
+    assert parse_loose_bias_grid("1,-1,0.5") == (1.0, -1.0, 0.5)
+
+
+@pytest.mark.parametrize(
+    "text", ["", "   ", "0,abc", "nan", "0,NaN", "inf", "0,inf", "-inf", "0,0", "1,1"]
+)
+def test_parse_loose_bias_grid_invalid(text: str) -> None:
+    """Empty, non-numeric, non-finite, and duplicate loose grids are rejected."""
+    with pytest.raises(ValueError, match="bias"):
+        parse_loose_bias_grid(text)
+
+
+def test_adjusted_prediction_zero_zero_is_identity() -> None:
+    """Explicit zero background and loose biases use the exact-equality path."""
+    probs = np.array([[[0.4, 0.35, 0.25], [0.1, 0.6, 0.3]]], dtype=np.float32)
+    pred, adjusted = adjusted_prediction(probs, background_bias=0.0, loose_bias=0.0)
+    np.testing.assert_array_equal(pred, np.argmax(probs, axis=-1))
+    np.testing.assert_array_equal(adjusted, probs)
+
+
+def test_adjusted_prediction_background_bias_shifts_only_class_0() -> None:
+    """A background-only bias rescales odds vs aggregate; loose/aggregate odds are untouched."""
+    probs = np.array([[[0.3, 0.5, 0.2], [0.2, 0.2, 0.6]]], dtype=np.float64)
+    delta = 0.5
+    _, adjusted = adjusted_prediction(probs, background_bias=delta, loose_bias=0.0)
+    # softmax(log p + delta * one_hot(0)): ratios encode the shift exactly.
+    ratio_bg = adjusted[..., 0] / adjusted[..., 2]
+    ratio_loose = adjusted[..., 1] / adjusted[..., 2]
+    expected_bg = probs[..., 0] / probs[..., 2] * math.exp(delta)
+    expected_loose = probs[..., 1] / probs[..., 2]
+    np.testing.assert_allclose(ratio_bg, expected_bg, rtol=1e-12)
+    np.testing.assert_allclose(ratio_loose, expected_loose, rtol=1e-12)
+    np.testing.assert_allclose(adjusted.sum(axis=-1), 1.0, rtol=1e-12)
+
+
+def test_adjusted_prediction_loose_bias_shifts_only_class_1() -> None:
+    """A loose-only bias rescales odds vs aggregate; background/aggregate odds are untouched."""
+    probs = np.array([[[0.3, 0.5, 0.2], [0.2, 0.2, 0.6]]], dtype=np.float64)
+    delta = -0.75
+    _, adjusted = adjusted_prediction(probs, background_bias=0.0, loose_bias=delta)
+    ratio_bg = adjusted[..., 0] / adjusted[..., 2]
+    ratio_loose = adjusted[..., 1] / adjusted[..., 2]
+    expected_bg = probs[..., 0] / probs[..., 2]
+    expected_loose = probs[..., 1] / probs[..., 2] * math.exp(delta)
+    np.testing.assert_allclose(ratio_bg, expected_bg, rtol=1e-12)
+    np.testing.assert_allclose(ratio_loose, expected_loose, rtol=1e-12)
+    np.testing.assert_allclose(adjusted.sum(axis=-1), 1.0, rtol=1e-12)
+
+
+def test_adjusted_prediction_loose_bias_direction_hand_computed() -> None:
+    """A negative loose bias moves argmax decisions from loose cell toward aggregate."""
+    probs = np.array([[[0.4, 0.35, 0.25]]], dtype=np.float64)
+    pred_zero, _ = adjusted_prediction(probs, 0.0, 0.0)
+    assert pred_zero[0, 0] == 0  # background wins at (0.4, 0.35, 0.25)
+
+    # Foreground-only probe: background suppressed, loose vs aggregate compete.
+    fg = np.array([[[0.05, 0.55, 0.4]]], dtype=np.float64)
+    pred_pos, _ = adjusted_prediction(fg, 0.0, 0.5)
+    assert pred_pos[0, 0] == 1
+    pred_neg, _ = adjusted_prediction(fg, 0.0, -0.5)
+    assert pred_neg[0, 0] == 2
+
+    # Hand-computed combined shift: softmax(log p + [0.25, -0.5, 0]).
+    combined = np.array([[[0.3, 0.5, 0.2]]], dtype=np.float64)
+    _, adjusted = adjusted_prediction(combined, background_bias=0.25, loose_bias=-0.5)
+    logp = np.log(combined) + np.array([0.25, -0.5, 0.0])
+    expected = np.exp(logp) / np.exp(logp).sum(axis=-1, keepdims=True)
+    np.testing.assert_allclose(adjusted, expected, rtol=1e-12)
+
+
+def test_foreground_transition_rates_hand_computed() -> None:
+    """Row-normalized loose<->aggregate transition rates follow their definitions."""
+    confusion = np.array([[100, 5, 5], [10, 20, 30], [5, 15, 40]], dtype=np.uint32)
+    rates = foreground_transition_rates(confusion)
+    # GT loose cell row sums to 60; 30 predicted as aggregate.
+    assert rates["loose_to_aggregate"] == pytest.approx(0.5)
+    # GT aggregate row sums to 60; 15 predicted as loose cell.
+    assert rates["aggregate_to_loose"] == pytest.approx(0.25)
+
+
+def test_foreground_transition_rates_nan_on_empty_gt_rows() -> None:
+    """An empty GT row yields NaN, never an invented rate."""
+    confusion = np.array([[50, 0, 0], [0, 0, 0], [5, 15, 40]], dtype=np.uint32)
+    rates = foreground_transition_rates(confusion)
+    assert math.isnan(rates["loose_to_aggregate"])
+    assert rates["aggregate_to_loose"] == pytest.approx(15 / 60)
+
+
+def _combined_accumulators(probs: np.ndarray, target: np.ndarray) -> BiasGridAccumulators:
+    """Feed an 8x8 image as four 4x4 tiles into a 2x2 (background x loose) grid."""
+    accumulators = BiasGridAccumulators((0.0, 0.5), num_classes=3, loose_bias_grid=(-1.0, 0.0))
+    accumulators.begin_image()
+    for r0, r1 in ((0, 4), (4, 8)):
+        for c0, c1 in ((0, 4), (4, 8)):
+            for combo_index, (bg, lb) in enumerate(accumulators.combinations):
+                pred, adjusted = adjusted_prediction(probs[r0:r1, c0:c1], bg, lb)
+                accumulators.add_tile(
+                    combo_index,
+                    groups=("overall", "4x"),
+                    prediction=pred,
+                    target=target[r0:r1, c0:c1],
+                    probs_for_scores=adjusted,
+                )
+    accumulators.end_image(("overall", "4x"))
+    return accumulators
+
+
+def test_combined_grid_matches_one_shot_references_per_combination() -> None:
+    """Every (background, loose) combination matches an independent one-shot reference.
+
+    Covers exact confusion counts, proper scores, and independence between
+    combinations: each combo is compared against its own full-image reference
+    computed directly from the raw probabilities.
+    """
+    rng = np.random.default_rng(7)
+    probs = rng.dirichlet(np.ones(3), size=(8, 8)).astype(np.float32)
+    target = rng.integers(0, 3, size=(8, 8))
+    accumulators = _combined_accumulators(probs, target)
+
+    assert accumulators.combinations == (
+        (0.0, -1.0),
+        (0.0, 0.0),
+        (0.5, -1.0),
+        (0.5, 0.0),
+    )
+    for combo_index, (bg, lb) in enumerate(accumulators.combinations):
+        pred_ref, adjusted_ref = adjusted_prediction(probs, bg, lb)
+        expected = np.zeros((3, 3), dtype=np.int64)
+        for t in range(3):
+            for p in range(3):
+                expected[t, p] = int(np.count_nonzero((target == t) & (pred_ref == p)))
+        np.testing.assert_array_equal(
+            accumulators.confusion(combo_index, "overall").astype(np.int64), expected
+        )
+
+        reference = proper_score_partial_sums(adjusted_ref, target, 3)
+        rows = accumulators.finalize_foreground(n_images={"overall": 1, "4x": 1})
+        all_row = [
+            row
+            for row in rows
+            if row[0] == repr(float(bg))
+            and row[1] == repr(float(lb))
+            and row[2] == "overall"
+            and row[3] == "all"
+        ][0]
+        assert float(all_row[8]) == pytest.approx(
+            float(reference["brier_sum"] / reference["n_pixels"]), rel=1e-12
+        )
+        assert float(all_row[9]) == pytest.approx(
+            float(reference["log_loss_sum"] / reference["n_pixels"]), rel=1e-12
+        )
+
+
+def test_combined_grid_zero_zero_reproduces_raw_argmax() -> None:
+    """The (0, 0) combination is bit-identical to the raw-probability eval path."""
+    rng = np.random.default_rng(8)
+    probs = rng.dirichlet(np.ones(3), size=(8, 8)).astype(np.float32)
+    target = rng.integers(0, 3, size=(8, 8))
+    accumulators = _combined_accumulators(probs, target)
+
+    zero_index = accumulators.combinations.index((0.0, 0.0))
+    pred_raw = np.argmax(probs, axis=-1)
+    expected = np.zeros((3, 3), dtype=np.int64)
+    for t in range(3):
+        for p in range(3):
+            expected[t, p] = int(np.count_nonzero((target == t) & (pred_raw == p)))
+    np.testing.assert_array_equal(
+        accumulators.confusion(zero_index, "overall").astype(np.int64), expected
+    )
+
+
+def test_finalize_foreground_macro_dice_and_empty_cells() -> None:
+    """foreground_macro_dice is the mean of loose/aggregate Dice, empty elsewhere."""
+    rng = np.random.default_rng(9)
+    probs = rng.dirichlet(np.ones(3), size=(8, 8)).astype(np.float32)
+    target = rng.integers(0, 3, size=(8, 8))
+    accumulators = _combined_accumulators(probs, target)
+    rows = accumulators.finalize_foreground(n_images={"overall": 1, "4x": 1})
+
+    # 4 combos x 2 groups x (3 classes + object + all) rows, 14 columns each.
+    assert len(rows) == 4 * 2 * 5
+    assert all(len(row) == 14 for row in rows)
+
+    for bg_str, lb_str in {("0.0", "-1.0"), ("0.0", "0.0"), ("0.5", "-1.0"), ("0.5", "0.0")}:
+        for group in ("overall", "4x"):
+            block = {
+                row[3]: row
+                for row in rows
+                if row[0] == bg_str and row[1] == lb_str and row[2] == group
+            }
+            assert set(block) == {"background", "loose cell", "aggregate", "object", "all"}
+            loose_dice = float(block["loose cell"][4])
+            agg_dice = float(block["aggregate"][4])
+            macro = (loose_dice + agg_dice) / 2.0
+            assert float(block["loose cell"][13]) == macro
+            assert float(block["aggregate"][13]) == macro
+            # Not meaningful on background/object/all rows: empty cell (NaN).
+            for name in ("background", "object", "all"):
+                assert math.isnan(float(block[name][13]))
+            # object row: proper scores empty; all row: segmentation metrics empty.
+            assert math.isnan(float(block["object"][8])) and math.isnan(float(block["object"][9]))
+            for col in (4, 5, 6, 7):
+                assert math.isnan(float(block["all"][col]))
+
+
+def test_finalize_background_only_emits_loose_zero_slice() -> None:
+    """bias_sweep.csv rows come only from loose_bias == 0 combinations."""
+    rng = np.random.default_rng(10)
+    probs = rng.dirichlet(np.ones(3), size=(8, 8)).astype(np.float32)
+    target = rng.integers(0, 3, size=(8, 8))
+    accumulators = _combined_accumulators(probs, target)
+    rows = accumulators.finalize(n_images={"overall": 1, "4x": 1})
+    # Only (bg, loose=0) combos: 2 biases x 2 groups x 5 rows; old 12-column schema.
+    assert len(rows) == 2 * 2 * 5
+    assert all(len(row) == 12 for row in rows)
+    assert {row[0] for row in rows} == {"0.0", "0.5"}
+
+    # A loose grid without 0 yields header-only background sweep rows.
+    none_zero = BiasGridAccumulators((0.0,), num_classes=3, loose_bias_grid=(-1.0, 1.0))
+    assert none_zero.finalize(n_images={"overall": 1}) == []
+
+
+def test_foreground_confusion_rows_cover_every_combination() -> None:
+    """foreground_bias_confusion.csv rows exist for all combos, groups, and 3x3 cells."""
+    rng = np.random.default_rng(11)
+    probs = rng.dirichlet(np.ones(3), size=(8, 8)).astype(np.float32)
+    target = rng.integers(0, 3, size=(8, 8))
+    accumulators = _combined_accumulators(probs, target)
+
+    rows = accumulators.foreground_confusion_rows()
+    assert len(rows) == 4 * 2 * 9
+    for combo_index, (bg, lb) in enumerate(accumulators.combinations):
+        for group in ("overall", "4x"):
+            block = [
+                row
+                for row in rows
+                if row[0] == repr(float(bg)) and row[1] == repr(float(lb)) and row[2] == group
+            ]
+            assert len(block) == 9
+            counts = np.array([row[5] for row in block], dtype=np.int64).reshape(3, 3)
+            np.testing.assert_array_equal(
+                counts, accumulators.confusion(combo_index, group).astype(np.int64)
+            )
+
+    # The background-only confusion CSV stays on the loose-0 slice.
+    bg_rows = accumulators.confusion_rows()
+    assert len(bg_rows) == 2 * 2 * 9
+    assert all(len(row) == 5 for row in bg_rows)
+
+
+def test_sweep_full_image_combined_grid_excludes_reflect_padding() -> None:
+    """Reflect-padded pixels stay excluded from every bias combination."""
+    rng = np.random.default_rng(12)
+    tile_size = 16
+    image_h, image_w = 20, 12
+    image = rng.random((image_h, image_w)).astype(np.float32)
+    target = rng.integers(0, 3, size=(image_h, image_w)).astype(np.uint8)
+
+    tiles, padding = _extract_tiles_local(image, tile_size)
+    n_tiles = tiles.shape[0]
+    probs = np.empty((n_tiles, tile_size, tile_size, 3), dtype=np.float32)
+    valid = np.zeros((tile_size, tile_size), dtype=bool)
+    slices = _tile_valid_slices(padding)
+    for r0, r1, c0, c1 in slices:
+        valid[r0:r1, c0:c1] = True
+    probs[:] = np.array([0.5, 0.3, 0.2], dtype=np.float32)
+    for t in range(n_tiles):
+        padded_view = np.broadcast_to(np.array([0.01, 0.9, 0.09], np.float32), probs[t].shape)
+        probs[t] = np.where(valid[..., None], probs[t], padded_view)
+
+    accumulators = BiasGridAccumulators((0.0, 2.0), num_classes=3, loose_bias_grid=(-1.0, 0.0, 1.0))
+    baseline_pred = sweep_full_image(
+        predict_fn=_StubPredict([probs]),
+        params=None,
+        batch_stats=None,
+        image=image,
+        mask=target,
+        tile_size=tile_size,
+        batch_size=n_tiles,
+        num_classes=3,
+        accumulators=accumulators,
+        mag="4x",
+    )
+    np.testing.assert_array_equal(baseline_pred, np.zeros((image_h, image_w), np.uint8))
+
+    gt_counts = np.bincount(target.ravel(), minlength=3)
+    for combo_index, (bg, lb) in enumerate(accumulators.combinations):
+        confusion = accumulators.confusion(combo_index, "overall").astype(np.int64)
+        assert int(confusion.sum()) == image_h * image_w, f"combo {(bg, lb)} counted padding"
+        np.testing.assert_array_equal(confusion.sum(axis=1), gt_counts)
+        if bg == 2.0:
+            # The strong background bias suppresses all foreground regardless of loose bias.
+            assert int(confusion[:, 1:].sum()) == 0
+    # At (0, +1) the loose boost flips the valid pixels from background to loose cell.
+    plus_one = accumulators.combinations.index((0.0, 1.0))
+    assert int(accumulators.confusion(plus_one, "overall")[:, 1:].sum()) == image_h * image_w
+
+
+def test_select_best_combinations_unique_and_ties() -> None:
+    """Best-combination selection reports every exact tie, never partial results."""
+    rows = [
+        {
+            "background_bias": 0.0,
+            "loose_bias": -1.0,
+            "foreground_macro_dice": 0.50,
+            "object_dice": 0.70,
+        },
+        {
+            "background_bias": 0.0,
+            "loose_bias": 0.0,
+            "foreground_macro_dice": 0.50,
+            "object_dice": 0.60,
+        },
+        {
+            "background_bias": 0.5,
+            "loose_bias": 0.0,
+            "foreground_macro_dice": 0.40,
+            "object_dice": 0.65,
+        },
+    ]
+    best_macro = select_best_combinations(rows, "foreground_macro_dice")
+    assert {(r["background_bias"], r["loose_bias"]) for r in best_macro} == {
+        (0.0, -1.0),
+        (0.0, 0.0),
+    }
+    best_object = select_best_combinations(rows, "object_dice")
+    assert [(r["background_bias"], r["loose_bias"]) for r in best_object] == [(0.0, -1.0)]
+
+
+def test_select_best_combinations_never_selects_nan() -> None:
+    """A NaN metric never wins; if all rows are NaN there is no best row."""
+    rows = [
+        {"background_bias": 0.0, "loose_bias": -1.0, "loose_dice": math.nan},
+        {"background_bias": 0.0, "loose_bias": 0.0, "loose_dice": 0.2},
+    ]
+    best = select_best_combinations(rows, "loose_dice")
+    assert [(r["background_bias"], r["loose_bias"]) for r in best] == [(0.0, 0.0)]
+    nan_rows = [{"loose_dice": math.nan}, {"loose_dice": math.nan}]
+    assert select_best_combinations(nan_rows, "loose_dice") == []
