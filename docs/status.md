@@ -4,12 +4,14 @@ Living snapshot of progress, decisions made after `docs/design.md`, and pending
 items. Update at the end of every module. Design rationale lives in
 `docs/design.md`; conventions in `AGENTS.md`; this file only tracks *where we are*.
 
-Last updated: 2026-10-09 (notebook refactored into an explicit experiment
-runner: settings-only first cell, resolved execution plan gate, repository
-synchronization with fast-forward-only updates, JAX/CUDA plugin repair, and a
-mandatory post-install JAX GPU gate; next controlled experiment prepared:
-background CE weight 0.5 via `configs/colab_bgweight05.yaml`; per-run patch
-class-prevalence logging added to `train.py`).
+Last updated: 2026-10-16 (validation diagnostics extended with a post-hoc
+loose-vs-aggregate foreground-bias sweep, `--loose-bias-grid`: `aggregate`
+stays the reference foreground class while the loose-cell logit is shifted,
+optionally combined with the background bias; adds
+`foreground_bias_sweep.csv` / `foreground_bias_confusion.csv` and a summary
+Part 4 table with loose↔aggregate transition rates and best combinations;
+motivated by the background-weight-0.5 run's residual loose↔aggregate
+confusion; see `docs/evaluation.md` §Validation diagnostics Part 4).
 
 ## Modules
 
@@ -25,7 +27,7 @@ class-prevalence logging added to `train.py`).
 | CI — GitHub Actions | Done | lint + `pytest` matrix on Python 3.12/3.13/3.14; see `.github/workflows/ci.yml` |
 | M6 — Post-processing (v0.2) | Pending | instances, morphometrics, hybrid spheroid/organoid classification |
 | M7 — SLiMIA pre-training | Deferred | domain-shift risk; only if own data underperforms |
-| Validation diagnostics | Done | `python -m spheroid_seg.validation_diagnostics`: class prevalence (full-image + saved patches), FP connected components, post-hoc background-logit-bias sweep; read-only, streaming, CPU-safe; see `docs/evaluation.md` §Validation diagnostics |
+| Validation diagnostics | Done | `python -m spheroid_seg.validation_diagnostics`: class prevalence (full-image + saved patches), FP connected components, post-hoc background-logit-bias sweep, and an optional loose-vs-aggregate foreground-bias sweep (`--loose-bias-grid`, aggregate as reference class); read-only, streaming, CPU-safe; see `docs/evaluation.md` §Validation diagnostics |
 | Patch class-prevalence logging | Done | fresh `train.py` runs write `logs/patch_class_prevalence.csv` with exact post-augmentation train/val patch counts (uint64, `numpy.bincount`) plus an stdout summary; read-only, RNG-free; resume preserves the file; see `docs/training.md` §Patch class prevalence logging |
 
 ## First real-data baseline
@@ -151,6 +153,27 @@ Run it on Colab with the notebook's controlled-experiment settings
 then writes to `outputs/runs/colab_bgweight05_<timestamp>/`, never
 `base_<timestamp>` (that prefix belongs only to the optional
 overfit-one-batch quickstart check).
+
+### Foreground-bias sweep diagnostic (2026-10-16)
+
+The background-weight-0.5 run (`colab_bgweight05_drive_20261013_131654`)
+reduced the broad foreground overprediction — its background-bias optimum
+moved from δ ≈ 2.0 (previous run) to ≈ 0.5, and full-image val object Dice
+at bias 0 is 0.6854 (precision 0.5853, recall 0.8268; aggregate Dice
+0.5931, loose Dice 0.3822). The residual error is dominated by
+loose↔aggregate cross-confusion: 43.24% of GT loose-cell pixels are
+predicted as aggregate vs 8.54% the other way around. To test whether this
+residual has a post-hoc class-prior component before designing the next
+training experiment, the validation diagnostics command gained Part 4
+(`--loose-bias-grid`): a grid over the loose-cell logit with `aggregate` as
+the un-biased reference foreground class, optionally crossed with the
+background grid, evaluated post-hoc from the same per-tile probabilities
+(single inference per tile; exact uint32 confusions per combination; the
+(0, 0) combination reproduces the baseline diagnostics bit for bit). It is
+read-only — never modifies the checkpoint — and reports
+`foreground_bias_sweep.csv`, `foreground_bias_confusion.csv`, and a summary
+table with loose↔aggregate transition rates and the best combinations by
+foreground macro Dice / per-class Dice / object Dice.
 
 ## Decisions made after the design doc
 

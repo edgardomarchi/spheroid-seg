@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -375,3 +376,298 @@ def test_bias_sweep_monotonic_on_real_model(trained_run: dict) -> None:
     # count need not reach zero on a real checkpoint (unit tests cover the
     # all-background guarantee with strictly positive probabilities).
     assert counts[-1] < counts[0]
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — loose-vs-aggregate foreground-bias sweep (CLI)
+# ---------------------------------------------------------------------------
+
+FOREGROUND_SWEEP_HEADER = [
+    "background_bias",
+    "loose_bias",
+    "group",
+    "class",
+    "dice",
+    "iou",
+    "precision",
+    "recall",
+    "brier",
+    "log_loss",
+    "gt_pixels",
+    "pred_pixels",
+    "n_images",
+    "foreground_macro_dice",
+]
+FOREGROUND_CONFUSION_HEADER = [
+    "background_bias",
+    "loose_bias",
+    "group",
+    "gt",
+    "prediction",
+    "count",
+]
+
+_LOOSE_GRID_KWARGS = {
+    "background_bias_grid": "0,0.5",
+    "loose_bias_grid": "-1,0,1",
+}
+
+
+def _overall_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [r for r in rows if r["group"] == "overall"]
+
+
+def test_loose_bias_grid_writes_foreground_outputs(trained_run: dict) -> None:
+    """Non-default loose grids add both foreground CSVs with the exact schemas."""
+    result = _run_diagnostics(
+        trained_run["config_path"],
+        run_dir=trained_run["run_dir"],
+        split="val",
+        **_LOOSE_GRID_KWARGS,
+    )
+    assert result.returncode == 0, result.stderr
+    out = _diagnostics_dirs(trained_run["config_path"])[-1]
+
+    sweep_path = out / "foreground_bias_sweep.csv"
+    confusion_path = out / "foreground_bias_confusion.csv"
+    assert sweep_path.exists()
+    assert confusion_path.exists()
+
+    sweep = _read_csv(sweep_path)
+    confusion = _read_csv(confusion_path)
+    assert list(sweep[0].keys()) == FOREGROUND_SWEEP_HEADER
+    assert list(confusion[0].keys()) == FOREGROUND_CONFUSION_HEADER
+
+    # Every requested combination appears for every group and class row kind.
+    combos = {(r["background_bias"], r["loose_bias"]) for r in sweep}
+    assert combos == {
+        ("0.0", "-1.0"),
+        ("0.0", "0.0"),
+        ("0.0", "1.0"),
+        ("0.5", "-1.0"),
+        ("0.5", "0.0"),
+        ("0.5", "1.0"),
+    }
+    assert {r["group"] for r in sweep} == {"overall", "10x", "4x"}
+    assert {r["class"] for r in sweep} == {"background", "loose cell", "aggregate", "object", "all"}
+    assert len(sweep) == 6 * 3 * 5
+
+    # foreground_macro_dice is the mean of the two per-class Dice cells and is
+    # empty on background/object/all rows.
+    for (bg, lb), group in {((r["background_bias"], r["loose_bias"]), r["group"]) for r in sweep}:
+        block = {
+            r["class"]: r
+            for r in sweep
+            if (r["background_bias"], r["loose_bias"]) == (bg, lb) and r["group"] == group
+        }
+        macro = (float(block["loose cell"]["dice"]) + float(block["aggregate"]["dice"])) / 2.0
+        assert float(block["loose cell"]["foreground_macro_dice"]) == pytest.approx(macro)
+        assert float(block["aggregate"]["foreground_macro_dice"]) == pytest.approx(macro)
+        for name in ("background", "object", "all"):
+            assert block[name]["foreground_macro_dice"] == ""
+
+    # Exact pooled confusion counts for every combination and group (3x3 cells).
+    assert len(confusion) == 6 * 3 * 9
+    for r in confusion:
+        assert int(r["count"]) >= 0
+    zero_zero = [
+        r
+        for r in confusion
+        if r["background_bias"] == "0.0" and r["loose_bias"] == "0.0" and r["group"] == "overall"
+    ]
+    assert {(r["gt"], r["prediction"]) for r in zero_zero} == {
+        (gt, pred)
+        for gt in ("background", "loose cell", "aggregate")
+        for pred in ("background", "loose cell", "aggregate")
+    }
+    total = sum(int(r["count"]) for r in zero_zero)
+    n_val_images = 2  # tiny.yaml synthetic fixture: val split of 8 images at seed 42
+    image_pixels = 256 * 256
+    assert total == n_val_images * image_pixels
+
+
+def _cells_equal(a: str, b: str) -> bool:
+    """CSV cell equality with NaN-awareness (empty cells mean NaN)."""
+    fa, fb = float(a or "nan"), float(b or "nan")
+    return fa == fb or (math.isnan(fa) and math.isnan(fb))
+
+
+def test_loose_bias_grid_zero_slice_reproduces_background_sweep(trained_run: dict) -> None:
+    """The (background, loose=0) slice of the new CSVs matches bias_sweep.csv exactly."""
+    config_path, run_dir = trained_run["config_path"], trained_run["run_dir"]
+    result = _run_diagnostics(config_path, run_dir=run_dir, split="val", **_LOOSE_GRID_KWARGS)
+    assert result.returncode == 0, result.stderr
+    out = _diagnostics_dirs(config_path)[-1]
+
+    bg_sweep = _read_csv(out / "bias_sweep.csv")
+    fg_sweep = _read_csv(out / "foreground_bias_sweep.csv")
+    metric_cols = [
+        "dice",
+        "iou",
+        "precision",
+        "recall",
+        "brier",
+        "log_loss",
+        "gt_pixels",
+        "pred_pixels",
+        "n_images",
+    ]
+    for bg_row in bg_sweep:
+        fg_row = next(
+            r
+            for r in fg_sweep
+            if r["background_bias"] == bg_row["background_bias"]
+            and r["loose_bias"] == "0.0"
+            and r["group"] == bg_row["group"]
+            and r["class"] == bg_row["class"]
+        )
+        for col in metric_cols:
+            assert _cells_equal(fg_row[col], bg_row[col]), col
+
+    bg_conf = _read_csv(out / "bias_sweep_confusion.csv")
+    fg_conf = _read_csv(out / "foreground_bias_confusion.csv")
+    for bg_row in bg_conf:
+        fg_row = next(
+            r
+            for r in fg_conf
+            if r["background_bias"] == bg_row["background_bias"]
+            and r["loose_bias"] == "0.0"
+            and r["group"] == bg_row["group"]
+            and r["gt"] == bg_row["gt"]
+            and r["prediction"] == bg_row["prediction"]
+        )
+        assert fg_row["count"] == bg_row["count"]
+
+
+@pytest.mark.parametrize("loose_grid", [None, "0"])
+def test_loose_bias_grid_default_writes_no_foreground_outputs(
+    trained_run: dict, loose_grid: str | None
+) -> None:
+    """Omitted or all-zero loose grids keep the outputs exactly as before."""
+    kwargs = {"background_bias_grid": "0,0.5"}
+    if loose_grid is not None:
+        kwargs["loose_bias_grid"] = loose_grid
+    result = _run_diagnostics(
+        trained_run["config_path"], run_dir=trained_run["run_dir"], split="val", **kwargs
+    )
+    assert result.returncode == 0, result.stderr
+    out = _diagnostics_dirs(trained_run["config_path"])[-1]
+
+    assert not (out / "foreground_bias_sweep.csv").exists()
+    assert not (out / "foreground_bias_confusion.csv").exists()
+    summary = (out / "summary.md").read_text()
+    assert "Part 4" not in summary
+    assert "loose bias grid" not in summary
+    # The classic outputs still carry the full background sweep.
+    rows = _read_csv(out / "bias_sweep.csv")
+    assert {r["background_bias"] for r in rows} == {"0.0", "0.5"}
+
+
+@pytest.mark.parametrize(
+    ("value", "hint"),
+    [
+        ("0,0", "bias"),
+        ("nan", "bias"),
+        ("-inf", "bias"),
+        ("1,abc", "bias"),
+    ],
+)
+def test_cli_rejects_invalid_loose_bias_grid(trained_run: dict, value: str, hint: str) -> None:
+    """Invalid loose grids exit non-zero with the same validation rules as background grids."""
+    result = _run_diagnostics(
+        trained_run["config_path"],
+        run_dir=trained_run["run_dir"],
+        split="val",
+        loose_bias_grid=value,
+    )
+    assert result.returncode != 0
+    assert hint in (result.stderr + result.stdout).lower()
+
+
+def test_summary_part4_table_and_best_combinations(trained_run: dict) -> None:
+    """summary.md gains the Part 4 table and correct best-combination lines."""
+    import re
+
+    result = _run_diagnostics(
+        trained_run["config_path"],
+        run_dir=trained_run["run_dir"],
+        split="val",
+        **_LOOSE_GRID_KWARGS,
+    )
+    assert result.returncode == 0, result.stderr
+    out = _diagnostics_dirs(trained_run["config_path"])[-1]
+    summary = (out / "summary.md").read_text()
+
+    assert "## Part 4 — loose-vs-aggregate foreground-bias sweep" in summary
+    for header in (
+        "background bias",
+        "loose bias",
+        "loose Dice",
+        "aggregate Dice",
+        "foreground macro Dice",
+        "object Dice",
+        "object precision",
+        "object recall",
+        "loose→aggregate rate",
+        "aggregate→loose rate",
+    ):
+        assert header in summary
+    # The header records the requested loose grid.
+    assert "loose bias grid" in summary
+
+    # One overall table row per requested combination (6 = 2 background x 3 loose).
+    sweep = _overall_rows(_read_csv(out / "foreground_bias_sweep.csv"))
+    assert len(sweep) == 6 * 5
+    for bg, lb in {
+        ("0.0", "-1.0"),
+        ("0.0", "0.0"),
+        ("0.0", "1.0"),
+        ("0.5", "-1.0"),
+        ("0.5", "0.0"),
+        ("0.5", "1.0"),
+    }:
+        assert any((r["background_bias"], r["loose_bias"]) == (bg, lb) for r in sweep), (
+            f"missing CSV row for combination {(bg, lb)}"
+        )
+        line = f"| {bg} | {lb} |"
+        assert line in summary, f"missing table row for combination {(bg, lb)}"
+
+    # Best-combination lines match the CSV maxima exactly (ties included).
+    best_lines = [line for line in summary.splitlines() if line.startswith("- max ")]
+    assert len(best_lines) == 4
+    metric_by_label = {
+        "foreground macro Dice": "foreground_macro_dice",
+        "loose cell Dice": "loose_dice",
+        "aggregate Dice": "aggregate_dice",
+        "object Dice": "object_dice",
+    }
+    # Build per-combination metric rows from the CSV for verification.
+    by_combo: dict[tuple[str, str], dict[str, float]] = {}
+    for bg, lb in {
+        ("0.0", "-1.0"),
+        ("0.0", "0.0"),
+        ("0.0", "1.0"),
+        ("0.5", "-1.0"),
+        ("0.5", "0.0"),
+        ("0.5", "1.0"),
+    }:
+        block = {
+            r["class"]: r for r in sweep if (r["background_bias"], r["loose_bias"]) == (bg, lb)
+        }
+        by_combo[(bg, lb)] = {
+            "foreground_macro_dice": float(block["loose cell"]["foreground_macro_dice"]),
+            "loose_dice": float(block["loose cell"]["dice"]),
+            "aggregate_dice": float(block["aggregate"]["dice"]),
+            "object_dice": float(block["object"]["dice"]),
+        }
+    combo_pattern = re.compile(r"\(background bias ([-\d.]+), loose bias ([-\d.]+)\)")
+    for line in best_lines:
+        label = line[len("- max ") :].split(" (", 1)[0]
+        assert label in metric_by_label, f"unexpected best line: {line}"
+        value = float(line.split("(", 2)[1].split(")")[0])
+        combos_in_line = set(combo_pattern.findall(line))
+        key = metric_by_label[label]
+        best_value = max(v[key] for v in by_combo.values())
+        assert value == round(best_value, 4)
+        expected_combos = {(bg, lb) for (bg, lb), v in by_combo.items() if v[key] == best_value}
+        assert combos_in_line == expected_combos, f"{label}: {combos_in_line} != {expected_combos}"

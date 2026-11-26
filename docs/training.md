@@ -393,6 +393,15 @@ Note the seed fixes the random *sequence*, not the content: changing code
 that consumes randomness (e.g. the synthetic generator) legitimately changes
 all downstream numbers.
 
+On GPU, `train.py` sets XLA's documented `--xla_gpu_autotune_level=0` option
+before importing JAX, and the pytest entry point does the same before test
+modules import JAX. Existing unrelated `XLA_FLAGS` are preserved. This disables
+timing-based GEMM/convolution autotuning, whose live measurements can select
+different kernels and reduction orders across otherwise identical runs. The
+setting must be in place before JAX initializes its GPU backend. It covers the
+tested training configuration, not a claim of deterministic behavior for every
+JAX operation or GPU backend.
+
 ## Sanity checks and what to expect
 
 - **Overfit-one-batch** (smoke config): loss should fall monotonically to
