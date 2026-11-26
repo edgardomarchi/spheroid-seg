@@ -1,16 +1,27 @@
 """Training loop for the spheroid segmentation U-Net."""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
 import copy
 import csv
 import datetime
+import os
 import tempfile
 from collections.abc import Iterator
 from functools import partial
 from pathlib import Path
 from typing import Any
+
+_DETERMINISTIC_XLA_FLAG = "--xla_gpu_autotune_level=0"
+_XLA_FLAGS = [
+    flag
+    for flag in os.environ.get("XLA_FLAGS", "").split()
+    if not flag.startswith("--xla_gpu_autotune_level=")
+]
+os.environ["XLA_FLAGS"] = " ".join([*_XLA_FLAGS, _DETERMINISTIC_XLA_FLAG])
 
 import flax.serialization
 import jax
